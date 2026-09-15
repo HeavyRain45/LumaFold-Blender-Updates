@@ -7,7 +7,7 @@
       "id": "lumafold",
       "name": "LumaFold Blender",
       "tagline": "Sculpt workflow companion with floating and satellite workspaces",
-      "version": "0.8.12",
+      "version": "0.8.13",
       "type": "add-on",
       "maintainer": "LumaFold",
       "license": [
@@ -21,9 +21,9 @@
       "platforms": [
         "windows-x64"
       ],
-      "archive_url": "./lumafold-0.8.12.zip",
-      "archive_size": 534609,
-      "archive_hash": "sha256:ce93527f946fa333924b73a456ff8a3a19b275568bff37f629b87d359cc51094"
+      "archive_url": "./lumafold-0.8.13.zip",
+      "archive_size": 535080,
+      "archive_hash": "sha256:c56843d4a147613be53d9cd3a63252afbbb2849e91b65094f0d3d8940a9f07f6"
     }
   ]
 }
