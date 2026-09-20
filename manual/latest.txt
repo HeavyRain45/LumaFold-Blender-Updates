@@ -1,2 +1,1 @@
-LumaFold 0.8.54 manual ZIP (Blender 5.0+ Windows x64)
-https://raw.githubusercontent.com/HeavyRain45/LumaFold-Blender-Updates/main/manual/lumafold-0.8.54.zip
+0.8.55
