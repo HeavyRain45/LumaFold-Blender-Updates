@@ -151,7 +151,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $package = (Resolve-Path "$PWD/manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v7.zip").Path
 
-          foreach ($version in @('5.2.0', '5.2.2')) {
+          foreach ($version in @('5.2.2')) {
             $archive = Join-Path $env:RUNNER_TEMP "blender-$version-windows-x64.zip"
             $blenderRoot = Join-Path $env:RUNNER_TEMP "blender-$version"
             if (Test-Path $blenderRoot) { Remove-Item $blenderRoot -Recurse -Force }
