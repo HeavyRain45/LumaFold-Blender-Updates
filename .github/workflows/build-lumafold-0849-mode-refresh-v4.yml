@@ -49,29 +49,30 @@ jobs:
           actual_start = normalized.index('                actual = str(getattr(bpy.context, "mode", "") or "").upper()', queue_start)
           except_pos = normalized.index("            except Exception as exc:", actual_start)
 
-          insert = '''                # Mode switching is deferred out of the ImGui draw frame. The
-                  # command completes after the click frame was already rendered.
-                  # Refresh the existing Embedded Host and explicitly redraw its
-                  # View3D so SCULPT/OBJECT is visible without reopening LumaFold.
-                  try:
-                      host = getattr(STATE, "host", None)
-                      window = _window_by_ptr(source_window_ptr)
-                      redraw_target = _best_view3d_context(window) if window is not None else _best_view3d_context()
-                      if redraw_target is not None:
-                          redraw_window, redraw_area, _redraw_region = redraw_target
-                          if host is not None and not bool(getattr(host, "closed", False)):
-                              try:
-                                  workspace_name = str(getattr(getattr(redraw_window, "workspace", None), "name", "") or "")
-                                  host.context_transition_pulse(workspace_name=workspace_name, mode=actual)
-                              except Exception:
-                                  pass
-                          try:
-                              redraw_area.tag_redraw()
-                          except Exception:
-                              pass
-                  except Exception:
-                      pass
-          '''
+          insert = (
+              "                # Mode switching is deferred out of the ImGui draw frame. The\n"
+              "                # command completes after the click frame was already rendered.\n"
+              "                # Refresh the existing Embedded Host and explicitly redraw its\n"
+              "                # View3D so SCULPT/OBJECT is visible without reopening LumaFold.\n"
+              "                try:\n"
+              "                    host = getattr(STATE, \"host\", None)\n"
+              "                    window = _window_by_ptr(source_window_ptr)\n"
+              "                    redraw_target = _best_view3d_context(window) if window is not None else _best_view3d_context()\n"
+              "                    if redraw_target is not None:\n"
+              "                        redraw_window, redraw_area, _redraw_region = redraw_target\n"
+              "                        if host is not None and not bool(getattr(host, \"closed\", False)):\n"
+              "                            try:\n"
+              "                                workspace_name = str(getattr(getattr(redraw_window, \"workspace\", None), \"name\", \"\") or \"\")\n"
+              "                                host.context_transition_pulse(workspace_name=workspace_name, mode=actual)\n"
+              "                            except Exception:\n"
+              "                                pass\n"
+              "                        try:\n"
+              "                            redraw_area.tag_redraw()\n"
+              "                        except Exception:\n"
+              "                            pass\n"
+              "                except Exception:\n"
+              "                    pass\n"
+          )
 
           normalized = normalized[:except_pos] + insert + normalized[except_pos:]
           text = normalized
