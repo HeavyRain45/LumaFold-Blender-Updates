@@ -1,0 +1,178 @@
+name: Build LumaFold 0.8.49 Satellite First-Stroke V3
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-lumafold-0849-satellite-firststroke-v3.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build-test-publish:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout update repository
+        uses: actions/checkout@v4
+
+      - name: Patch V2 candidate with two bounded fixes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $script = Join-Path $env:RUNNER_TEMP 'patch_v3.py'
+          @'
+          import hashlib
+          import pathlib
+          import shutil
+          import zipfile
+
+          root = pathlib.Path.cwd()
+          source = root / "manual" / "candidates" / "lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v2.zip"
+          output = root / "manual" / "candidates" / "lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v3.zip"
+          sha_file = output.with_suffix(output.suffix + ".sha256.txt")
+          work = pathlib.Path(__import__("os").environ["RUNNER_TEMP"]) / "lumafold_v3_stage"
+
+          if not source.is_file():
+              raise SystemExit(f"source candidate missing: {source}")
+          shutil.rmtree(work, ignore_errors=True)
+          work.mkdir(parents=True)
+          with zipfile.ZipFile(source, "r") as zf:
+              zf.extractall(work)
+
+          # Fix 1: only keep the LumaFold launch button in View3D header.
+          panels = work / "panels.py"
+          ptext = panels.read_text(encoding="utf-8")
+          menu_line = '    row.menu("LUMAFOLD_MT_product_maintenance", text="", icon=\'DOWNARROW_HLT\')\n'
+          if menu_line in ptext:
+              ptext = ptext.replace(menu_line, "", 1)
+          if 'row.menu("LUMAFOLD_MT_product_maintenance"' in ptext:
+              raise SystemExit("maintenance dropdown still present")
+          panels.write_text(ptext, encoding="utf-8", newline="\n")
+
+          # Fix 2: do not queue a Blender get_state snapshot on every Satellite click.
+          # This is the remaining first-stroke collision suspect. Keep pointer-focus
+          # priming and MA_NOACTIVATE behavior unchanged.
+          sat = work / "desktop" / "satellite_host.py"
+          stext = sat.read_text(encoding="utf-8")
+
+          old = '''@_runtime.WNDPROC
+          def _wndproc_with_shortcut_capture(hwnd, msg, wparam, lparam):
+              global _last_reconcile_requested_at
+              if int(msg) == WM_MOUSEACTIVATE and not _interactions.shortcut_capture_active():
+                  _prime_pointer_focus()
+                  # Reconcile only when the user re-enters Satellite. Continuous idle
+                  # get_state used to queue Blender-main-thread snapshots that collided
+                  # with the first viewport/sculpt input after Satellite interaction.
+                  now = _runtime.time.monotonic()
+                  if now - float(_last_reconcile_requested_at) >= 0.25:
+                      _last_reconcile_requested_at = now
+                      try:
+                          _runtime.actions.put({"action": "get_state"})
+                      except Exception:
+                          pass
+                  return MA_NOACTIVATE
+          '''
+          new = '''@_runtime.WNDPROC
+          def _wndproc_with_shortcut_capture(hwnd, msg, wparam, lparam):
+              if int(msg) == WM_MOUSEACTIVATE and not _interactions.shortcut_capture_active():
+                  _prime_pointer_focus()
+                  # Important: ordinary Satellite re-entry must remain local-only.
+                  # Queuing get_state here schedules Blender-main-thread work exactly
+                  # when the user is about to return to the viewport, which can land
+                  # on the next Sculpt stroke. Startup/handoff reconciliation remains
+                  # owned by the existing one-shot ready/lease path.
+                  return MA_NOACTIVATE
+          '''
+          if old not in stext:
+              raise SystemExit("Satellite WM_MOUSEACTIVATE block did not match expected V2 source")
+          stext = stext.replace(old, new, 1)
+
+          # Remove now-unused throttle state only; no other Satellite behavior changes.
+          stext = stext.replace("_last_reconcile_requested_at = 0.0\n", "", 1)
+          if '_runtime.actions.put({"action": "get_state"})' in stext[stext.index("def _wndproc_with_shortcut_capture"):stext.index("if int(msg) == int(_runtime.WM_APP_SHOW)")]:
+              raise SystemExit("get_state is still queued from WM_MOUSEACTIVATE")
+          sat.write_text(stext, encoding="utf-8", newline="\n")
+
+          # Syntax gate for touched files.
+          compile(panels.read_text(encoding="utf-8"), str(panels), "exec")
+          compile(sat.read_text(encoding="utf-8"), str(sat), "exec")
+
+          # Preserve the self-contained runtime and the V2 Satellite launch/handoff fixes.
+          manifest = (work / "blender_manifest.toml").read_text(encoding="utf-8")
+          if 'wheels/slimgui-0.8.2-cp312-abi3-win_amd64.whl' not in manifest:
+              raise SystemExit("bundled slimgui manifest entry lost")
+          if not (work / "wheels" / "slimgui-0.8.2-cp312-abi3-win_amd64.whl").is_file():
+              raise SystemExit("bundled slimgui wheel lost")
+          launcher = (work / "desktop" / "launcher.py").read_text(encoding="utf-8")
+          if "_active_slimgui_import_root" not in launcher:
+              raise SystemExit("V2 active runtime launch fix lost")
+          if "awaiting_grant = False" not in sat.read_text(encoding="utf-8"):
+              raise SystemExit("V2 Satellite handoff reconcile lost")
+
+          output.unlink(missing_ok=True)
+          with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+              for item in sorted(work.rglob("*")):
+                  if item.is_file():
+                      zf.write(item, item.relative_to(work).as_posix())
+
+          digest = hashlib.sha256(output.read_bytes()).hexdigest()
+          sha_file.write_text(f"{digest}  {output.name}\n", encoding="utf-8")
+          print(f"Built {output} ({output.stat().st_size} bytes)")
+          print(f"SHA256 {digest}")
+          '@ | Set-Content -Path $script -Encoding UTF8
+          python $script
+
+      - name: Blender 5.2 clean install gate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $package = (Resolve-Path "$PWD/manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v3.zip").Path
+
+          foreach ($version in @('5.2.0', '5.2.2')) {
+            $archive = Join-Path $env:RUNNER_TEMP "blender-$version-windows-x64.zip"
+            $blenderRoot = Join-Path $env:RUNNER_TEMP "blender-$version"
+            if (Test-Path $blenderRoot) { Remove-Item $blenderRoot -Recurse -Force }
+
+            curl.exe -L --fail --retry 3 --retry-delay 2 "https://download.blender.org/release/Blender5.2/blender-$version-windows-x64.zip" -o $archive
+            if ($LASTEXITCODE -ne 0) { throw "Blender $version download failed" }
+            Expand-Archive -Path $archive -DestinationPath $blenderRoot -Force
+            $exe = Get-ChildItem -Path $blenderRoot -Filter blender.exe -Recurse | Select-Object -First 1
+            if (-not $exe) { throw "Blender $version executable not found" }
+
+            & $exe.FullName --command extension validate $package
+            if ($LASTEXITCODE -ne 0) { throw "Blender $version extension validation failed" }
+
+            $cleanRoot = Join-Path $env:RUNNER_TEMP "lumafold-v3-$version"
+            $cleanConfig = Join-Path $cleanRoot "config"
+            $cleanExtensions = Join-Path $cleanRoot "extensions"
+            $localRepo = Join-Path $cleanRoot "repo"
+            if (Test-Path $cleanRoot) { Remove-Item $cleanRoot -Recurse -Force }
+            New-Item -ItemType Directory -Path $cleanConfig -Force | Out-Null
+            New-Item -ItemType Directory -Path $cleanExtensions -Force | Out-Null
+            New-Item -ItemType Directory -Path $localRepo -Force | Out-Null
+            Copy-Item $package (Join-Path $localRepo 'lumafold-0.8.49.zip') -Force
+            & $exe.FullName --command extension server-generate --repo-dir $localRepo --html
+            if ($LASTEXITCODE -ne 0) { throw "repo generation failed" }
+
+            $env:BLENDER_USER_CONFIG = $cleanConfig
+            $indexPath = (Resolve-Path (Join-Path $localRepo 'index.json')).Path
+            $repoUrl = ([System.Uri]::new($indexPath)).AbsoluteUri
+            & $exe.FullName --online-mode --command extension repo-add lumafold_ci --clear-all --name 'LumaFold CI' --directory $cleanExtensions --url $repoUrl --source USER
+            if ($LASTEXITCODE -ne 0) { throw "repo-add failed" }
+            & $exe.FullName --online-mode --command extension install -s -e lumafold
+            if ($LASTEXITCODE -ne 0) { throw "clean install failed" }
+            Remove-Item Env:BLENDER_USER_CONFIG -ErrorAction SilentlyContinue
+          }
+
+      - name: Publish verified V3 candidate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config user.name 'LumaFold Build Bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v3.zip
+          git add manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v3.zip.sha256.txt
+          git commit -m "candidate: Satellite first-stroke V3 bounded hotfix"
+          git push origin HEAD:main
