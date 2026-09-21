@@ -186,23 +186,35 @@ jobs:
           root = pathlib.Path(r'''$installed''').resolve()
           sys.path.insert(0, str(root.parent))
 
-          # Import only LumaFold's business/runtime modules without executing
-          # the root __init__.py UI/WGL imports. This keeps the exact command/bridge
-          # code testable in Blender --background.
+          # Import only the exact files needed for the mode/bridge chain.
+          # Stub parent packages so none of their __init__.py files execute.
           import types
           package = types.ModuleType("lumafold")
           package.__path__ = [str(root)]
           package.__package__ = "lumafold"
           sys.modules["lumafold"] = package
+          for sub in ("core", "services", "modules", "runtime", "desktop"):
+              mod = types.ModuleType("lumafold." + sub)
+              mod.__path__ = [str(root / sub)]
+              mod.__package__ = "lumafold." + sub
+              sys.modules["lumafold." + sub] = mod
 
           from lumafold.core.app import APP
-          from lumafold.core.bootstrap import bootstrap_platform
           from lumafold.core.host_control import HOST_CONTROL
-          from lumafold.desktop.bridge_server import BRIDGE
+          from lumafold.services.blender import BlenderContextService
+          from lumafold.services.blender_mode_undo import BlenderModeUndoSafeService
+          from lumafold.modules import sculpt as sculpt_module
           from lumafold.runtime import sculpt_input_core
+          from lumafold.desktop.bridge_server import BRIDGE
           from lumafold.runtime import satellite_bridge_authority
 
-          bootstrap_platform(APP)
+          # Minimal production-equivalent registrations for the exact path.
+          APP.services.register("blender.context", BlenderContextService())
+          APP.services.register("blender.mode", BlenderModeUndoSafeService())
+          APP.capabilities.register("object.active", lambda x: x.has_active_object)
+          APP.capabilities.register("object.mesh", lambda x: x.has_active_object and x.active_object_type == "MESH")
+          APP.capabilities.register("mode.sculpt", lambda x: x.mode == "SCULPT")
+          sculpt_module.register(APP)
           sculpt_input_core.configure(APP, None, None, None, None)
           satellite_bridge_authority.install()
 
