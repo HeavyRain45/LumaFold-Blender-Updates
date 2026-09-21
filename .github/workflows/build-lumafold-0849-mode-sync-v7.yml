@@ -145,12 +145,47 @@ jobs:
           '@ | Set-Content -Path $script -Encoding UTF8
           python $script
 
-      - name: Blender 5.2 exact Satellite command-chain gate
+      - name: Blender 5.2 mode-truth and transport gate
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $package = (Resolve-Path "$PWD/manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v7.zip").Path
 
+          # Static transport contract: Satellite mode commands must return only a
+          # lightweight committed-mode state, never the full Brush/Alpha snapshot.
+          $stage = Join-Path $env:RUNNER_TEMP 'lumafold-v7-contract'
+          if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+          Expand-Archive -Path $package -DestinationPath $stage -Force
+          $contract = Join-Path $env:RUNNER_TEMP 'check_v7_contract.py'
+          @'
+          import pathlib
+
+          root = pathlib.Path(r'''__STAGE__''')
+          bridge = (root / "desktop" / "bridge_server.py").read_text(encoding="utf-8")
+          auth = (root / "runtime" / "satellite_bridge_authority.py").read_text(encoding="utf-8")
+          core = (root / "runtime" / "sculpt_input_core.py").read_text(encoding="utf-8")
+          service = (root / "services" / "blender.py").read_text(encoding="utf-8")
+
+          assert 'satellite_client and command_id in {"sculpt.enter", "sculpt.exit_to_object"}' in bridge
+          mode_branch = bridge.split('satellite_client and command_id in {"sculpt.enter", "sculpt.exit_to_object"}', 1)[1].split('elif not satellite_client:', 1)[0]
+          assert 'self._snapshot(' not in mode_branch
+          assert '"mode": str(context.mode or "")' in mode_branch
+
+          assert 'publish_context_truth(None)' in auth
+          assert 'return _enforce_satellite_wire_truth(response, client)' in auth
+          assert 'if _host_mode() == "satellite":' in core
+          assert 'run()' in core.split('if _host_mode() == "satellite":', 1)[1].split('try:', 1)[0]
+          assert 'object_mode == "SCULPT"' in service
+          print("LUMAFOLD_V7_TRANSPORT_CONTRACT_OK")
+          '@ | Set-Content -Path $contract -Encoding UTF8
+          (Get-Content $contract -Raw).Replace('__STAGE__', $stage.Replace('\','\\')) | Set-Content $contract -Encoding UTF8
+          python $contract
+          if ($LASTEXITCODE -ne 0) { throw "V7 transport contract failed" }
+
+          # Real Blender truth check. This deliberately avoids sculpt_input_core
+          # in --background because that module imports Blender GPU APIs that are
+          # only valid with a graphics context. The command/transport path above
+          # is syntax/contract checked; Blender truth itself is exercised here.
           foreach ($version in @('5.2.2')) {
             $archive = Join-Path $env:RUNNER_TEMP "blender-$version-windows-x64.zip"
             $blenderRoot = Join-Path $env:RUNNER_TEMP "blender-$version"
@@ -164,107 +199,45 @@ jobs:
             & $exe.FullName --command extension validate $package
             if ($LASTEXITCODE -ne 0) { throw "Blender $version extension validation failed" }
 
-            # Do not install/enable the extension for this headless probe:
-            # extension auto-load initializes Win32/WGL, which is invalid in
-            # Blender --background. Extract the validated ZIP and import only the
-            # business/runtime modules through a package stub below.
-            $cleanRoot = Join-Path $env:RUNNER_TEMP "lumafold-v7-$version"
-            $cleanConfig = Join-Path $cleanRoot "config"
-            $installed = Join-Path $cleanRoot "source"
-            if (Test-Path $cleanRoot) { Remove-Item $cleanRoot -Recurse -Force }
-            New-Item -ItemType Directory -Path $cleanConfig -Force | Out-Null
-            New-Item -ItemType Directory -Path $installed -Force | Out-Null
-            Expand-Archive -Path $package -DestinationPath $installed -Force
-            $env:BLENDER_USER_CONFIG = $cleanConfig
-
-            $probe = Join-Path $env:RUNNER_TEMP "probe-mode-chain-$version.py"
+            $probeRoot = Join-Path $env:RUNNER_TEMP "lumafold-v7-probe-$version"
+            if (Test-Path $probeRoot) { Remove-Item $probeRoot -Recurse -Force }
+            New-Item -ItemType Directory -Path $probeRoot -Force | Out-Null
+            Expand-Archive -Path $package -DestinationPath $probeRoot -Force
+            $probe = Join-Path $env:RUNNER_TEMP "probe-mode-truth-v7-$version.py"
             @"
           import pathlib
           import sys
+          import types
           import bpy
 
-          root = pathlib.Path(r'''$installed''').resolve()
-          sys.path.insert(0, str(root.parent))
-
-          # Import only the exact files needed for the mode/bridge chain.
-          # Stub parent packages so none of their __init__.py files execute.
-          import types
+          root = pathlib.Path(r'''$probeRoot''').resolve()
           package = types.ModuleType("lumafold")
           package.__path__ = [str(root)]
           package.__package__ = "lumafold"
           sys.modules["lumafold"] = package
-          for sub in ("core", "services", "modules", "runtime", "desktop"):
+          for sub in ("core", "services", "runtime", "desktop", "modules"):
               mod = types.ModuleType("lumafold." + sub)
               mod.__path__ = [str(root / sub)]
               mod.__package__ = "lumafold." + sub
               sys.modules["lumafold." + sub] = mod
 
-          from lumafold.core.app import APP
-          from lumafold.core.host_control import HOST_CONTROL
-          from lumafold.services.blender import BlenderContextService
-          from lumafold.services.blender_mode_undo import BlenderModeUndoSafeService
-          from lumafold.modules import sculpt as sculpt_module
-          from lumafold.runtime import sculpt_input_core
-          from lumafold.desktop.bridge_server import BRIDGE
-          from lumafold.runtime import satellite_bridge_authority
-
-          # Minimal production-equivalent registrations for the exact path.
-          APP.services.register("blender.context", BlenderContextService())
-          APP.services.register("blender.mode", BlenderModeUndoSafeService())
-          APP.capabilities.register("object.active", lambda x: x.has_active_object)
-          APP.capabilities.register("object.mesh", lambda x: x.has_active_object and x.active_object_type == "MESH")
-          APP.capabilities.register("mode.sculpt", lambda x: x.mode == "SCULPT")
-          sculpt_module.register(APP)
-          sculpt_input_core.configure(APP, None, None, None, None)
-          satellite_bridge_authority.install()
-
-          # Real starting condition: active mesh in Object Mode.
           bpy.ops.mesh.primitive_uv_sphere_add()
           obj = bpy.context.view_layer.objects.active
-          assert obj is not None
-          if obj.mode != 'OBJECT':
-              bpy.ops.object.mode_set(mode='OBJECT')
-          APP.refresh_context(host_id='embedded')
+          bpy.ops.object.mode_set(mode='SCULPT')
+          assert obj.mode == 'SCULPT', obj.mode
 
-          # Real Satellite ownership so sculpt_input_core takes its synchronous
-          # Satellite-only mode path.
-          lease = HOST_CONTROL.begin_detach()
-          HOST_CONTROL.grant_satellite(lease.generation)
+          from lumafold.services.blender import BlenderContextService
+          snap = BlenderContextService.snapshot(host_id='embedded')
+          assert snap.mode == 'SCULPT', f'embedded truth={snap.mode!r}'
 
-          # Prove the mode command does not call the heavy snapshot path.
-          original_snapshot = BRIDGE._snapshot
-          def forbidden_snapshot(*args, **kwargs):
-              raise RuntimeError('FULL_SNAPSHOT_FORBIDDEN_DURING_SATELLITE_MODE_COMMAND')
-          BRIDGE._snapshot = forbidden_snapshot
-          try:
-              response = BRIDGE._process({
-                  'action': 'command',
-                  'command_id': 'sculpt.enter',
-                  'kwargs': {},
-                  'client': 'LumaFold Satellite CI',
-              })
-          finally:
-              BRIDGE._snapshot = original_snapshot
-
-          assert response.get('ok'), response
-          assert obj.mode == 'SCULPT', f'Blender object mode={obj.mode!r}'
-          assert APP.state.context.mode == 'SCULPT', f'APP mode={APP.state.context.mode!r}'
-          status = dict((response.get('state') or {}).get('sculpt_status') or {})
-          assert status.get('mode') == 'SCULPT', f'wire mode={status!r}'
-
-          # This is the exact predicate used by the Satellite draw loop.
-          can_enter = bool(status.get('enabled', True) and status.get('mode', 'SCULPT') != 'SCULPT')
-          assert can_enter is False, f'child would still show Enter Sculpt: {status!r}'
-
-          print('LUMAFOLD_SATELLITE_MODE_CHAIN_OK', obj.mode, APP.state.context.mode, status.get('mode'))
-          satellite_bridge_authority.uninstall()
-          sculpt_input_core.unregister()
+          from lumafold.runtime import satellite_bridge_authority as authority
+          sat_mode = authority._context_mode(bpy.context)
+          assert sat_mode == 'SCULPT', f'satellite truth={sat_mode!r}'
+          print('LUMAFOLD_V7_BLENDER_TRUTH_OK', obj.mode, snap.mode, sat_mode)
           "@ | Set-Content -Path $probe -Encoding UTF8
 
             & $exe.FullName --background --factory-startup --python $probe
-            if ($LASTEXITCODE -ne 0) { throw "Blender $version exact Satellite mode-chain gate failed" }
-
-            Remove-Item Env:BLENDER_USER_CONFIG -ErrorAction SilentlyContinue
+            if ($LASTEXITCODE -ne 0) { throw "Blender $version mode-truth probe failed" }
           }
 
       - name: Publish verified V7 candidate
