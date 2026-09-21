@@ -44,23 +44,18 @@ jobs:
           target = work / "runtime" / "sculpt_input_core.py"
           text = target.read_text(encoding="utf-8")
 
-          old = '''                actual = str(getattr(bpy.context, "mode", "") or "").upper()
-                  state["mode_request_status"] = (
+          marker = '''                state["mode_request_status"] = (
                       label + " · 完成" if actual == target_mode else f"{label} · Blender 当前={actual}"
                   )
           '''
-
-          new = '''                actual = str(getattr(bpy.context, "mode", "") or "").upper()
-                  state["mode_request_status"] = (
+          insert = '''                state["mode_request_status"] = (
                       label + " · 完成" if actual == target_mode else f"{label} · Blender 当前={actual}"
                   )
 
-                  # Mode switching is deferred out of the ImGui draw frame.  The
-                  # command therefore completes after the click frame has already
-                  # been rendered.  Explicitly refresh the existing Embedded Host
-                  # and tag its View3D for redraw here so the same floating table
-                  # immediately reflects SCULPT/OBJECT without requiring a close
-                  # and reopen through the top-right LumaFold button.
+                  # Mode switching is deferred out of the ImGui draw frame. The
+                  # command completes after the click frame was already rendered.
+                  # Refresh the existing Embedded Host and explicitly redraw its
+                  # View3D so SCULPT/OBJECT is visible without reopening LumaFold.
                   try:
                       host = getattr(STATE, "host", None)
                       window = _window_by_ptr(source_window_ptr)
@@ -81,9 +76,10 @@ jobs:
                       pass
           '''
 
-          if old not in text:
-              raise SystemExit("mode completion block did not match expected V3 source")
-          text = text.replace(old, new, 1)
+          normalized = text.replace("\r\n", "\n")
+          if normalized.count(marker) != 1:
+              raise SystemExit(f"mode completion marker count={normalized.count(marker)}; expected 1")
+          text = normalized.replace(marker, insert, 1)
           target.write_text(text, encoding="utf-8", newline="\n")
 
           # Touched-file syntax gate.
