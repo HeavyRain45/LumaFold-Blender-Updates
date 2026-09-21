@@ -1,0 +1,213 @@
+name: Build LumaFold 0.8.49 Self-Contained Candidate
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build-lumafold-0849-self-contained.yml'
+      - 'manual/candidates/lumafold-0.8.49-satellite-first-stroke-hotfix.zip'
+
+permissions:
+  contents: write
+
+jobs:
+  build-test-publish:
+    runs-on: windows-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout update repository
+        uses: actions/checkout@v4
+
+      - name: Build self-contained 0.8.49 package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $script = Join-Path $env:RUNNER_TEMP 'build_lumafold_complete.py'
+          @'
+          import hashlib
+          import os
+          import pathlib
+          import shutil
+          import urllib.request
+          import zipfile
+
+          root = pathlib.Path.cwd()
+          source = root / "manual" / "candidates" / "lumafold-0.8.49-satellite-first-stroke-hotfix.zip"
+          output = root / "manual" / "candidates" / "lumafold-0.8.49-complete-hotfix.zip"
+          sha_file = output.with_suffix(output.suffix + ".sha256.txt")
+          work = pathlib.Path(os.environ["RUNNER_TEMP"]) / "lumafold_complete_stage"
+          wheel = pathlib.Path(os.environ["RUNNER_TEMP"]) / "slimgui-0.8.2-cp312-abi3-win_amd64.whl"
+
+          wheel_url = "https://files.pythonhosted.org/packages/82/66/33ec0d18d023d700fd177ac55a4709d99402d62d0e463f446fbad19b0b7e/slimgui-0.8.2-cp312-abi3-win_amd64.whl"
+          wheel_sha256 = "1d48527068372a43eb52a0ac40857f1bcad8a1def93b17490f0cb3611fea56e8"
+
+          if not source.is_file():
+              raise SystemExit(f"source candidate missing: {source}")
+
+          shutil.rmtree(work, ignore_errors=True)
+          work.mkdir(parents=True)
+
+          with zipfile.ZipFile(source, "r") as zf:
+              zf.extractall(work)
+
+          manifest = (work / "blender_manifest.toml").read_text(encoding="utf-8")
+          if 'version = "0.8.49"' not in manifest:
+              raise SystemExit("unexpected source version")
+          if 'blender_version_min = "5.2.0"' not in manifest:
+              raise SystemExit("unexpected Blender minimum")
+
+          urllib.request.urlretrieve(wheel_url, wheel)
+          actual = hashlib.sha256(wheel.read_bytes()).hexdigest().lower()
+          if actual != wheel_sha256:
+              raise SystemExit(f"slimgui wheel SHA256 mismatch: {actual}")
+
+          vendor = work / "vendor"
+          shutil.rmtree(vendor, ignore_errors=True)
+          vendor.mkdir(parents=True)
+          with zipfile.ZipFile(wheel, "r") as zf:
+              zf.extractall(vendor)
+
+          bootstrap = work / "runtime" / "bootstrap.py"
+          text = bootstrap.read_text(encoding="utf-8")
+          old = """def _activate_vendor_path():
+              p = str(vendor_dir())
+              if p not in sys.path:
+                  sys.path.insert(0, p)
+          """
+          new = """def _bundled_vendor_dir():
+              return Path(__file__).resolve().parents[1] / "vendor"
+
+
+          def _activate_vendor_path():
+              # Legacy per-user runtime remains a fallback. The bundled runtime
+              # is inserted last so it has highest import priority.
+              p = str(vendor_dir())
+              if p not in sys.path:
+                  sys.path.insert(0, p)
+
+              bundled = _bundled_vendor_dir()
+              if bundled.is_dir():
+                  p = str(bundled)
+                  if p not in sys.path:
+                      sys.path.insert(0, p)
+          """
+          if old not in text:
+              raise SystemExit("bootstrap activation block not found")
+          bootstrap.write_text(text.replace(old, new, 1), encoding="utf-8", newline="\n")
+
+          required = [
+              work / "__init__.py",
+              work / "blender_manifest.toml",
+              work / "runtime" / "bootstrap.py",
+              work / "vendor",
+          ]
+          for item in required:
+              if not item.exists():
+                  raise SystemExit(f"required package item missing: {item}")
+
+          output.parent.mkdir(parents=True, exist_ok=True)
+          output.unlink(missing_ok=True)
+          with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+              for item in sorted(work.rglob("*")):
+                  if item.is_file():
+                      zf.write(item, item.relative_to(work).as_posix())
+
+          digest = hashlib.sha256(output.read_bytes()).hexdigest()
+          sha_file.write_text(f"{digest}  {output.name}\n", encoding="utf-8")
+          print(f"Built {output} ({output.stat().st_size} bytes)")
+          print(f"SHA256 {digest}")
+          '@ | Set-Content -Path $script -Encoding UTF8
+          python $script
+
+      - name: Clean install gate on Blender 5.2.0 and 5.2.2
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $package = (Resolve-Path "$PWD/manual/candidates/lumafold-0.8.49-complete-hotfix.zip").Path
+
+          foreach ($version in @('5.2.0', '5.2.2')) {
+            Write-Host "=== Blender $version clean-install gate ==="
+            $archive = Join-Path $env:RUNNER_TEMP "blender-$version-windows-x64.zip"
+            $blenderRoot = Join-Path $env:RUNNER_TEMP "blender-$version"
+            if (Test-Path $blenderRoot) { Remove-Item $blenderRoot -Recurse -Force }
+
+            curl.exe -L --fail --retry 3 --retry-delay 2 "https://download.blender.org/release/Blender5.2/blender-$version-windows-x64.zip" -o $archive
+            if ($LASTEXITCODE -ne 0) { throw "Blender $version download failed" }
+
+            Expand-Archive -Path $archive -DestinationPath $blenderRoot -Force
+            $exe = Get-ChildItem -Path $blenderRoot -Filter blender.exe -Recurse | Select-Object -First 1
+            if (-not $exe) { throw "Blender $version executable not found" }
+
+            & $exe.FullName --command extension validate $package
+            if ($LASTEXITCODE -ne 0) { throw "Blender $version extension validation failed" }
+
+            $cleanRoot = Join-Path $env:RUNNER_TEMP "lumafold-clean-$version"
+            $cleanConfig = Join-Path $cleanRoot "config"
+            $cleanExtensions = Join-Path $cleanRoot "extensions"
+            $localRepo = Join-Path $cleanRoot "repo"
+            if (Test-Path $cleanRoot) { Remove-Item $cleanRoot -Recurse -Force }
+            New-Item -ItemType Directory -Path $cleanConfig -Force | Out-Null
+            New-Item -ItemType Directory -Path $cleanExtensions -Force | Out-Null
+            New-Item -ItemType Directory -Path $localRepo -Force | Out-Null
+            Copy-Item $package (Join-Path $localRepo 'lumafold-0.8.49-complete-hotfix.zip') -Force
+
+            & $exe.FullName --command extension server-generate --repo-dir $localRepo --html
+            if ($LASTEXITCODE -ne 0) { throw "Blender $version local repository generation failed" }
+
+            $env:BLENDER_USER_CONFIG = $cleanConfig
+            $indexPath = (Resolve-Path (Join-Path $localRepo 'index.json')).Path
+            $repoUrl = ([System.Uri]::new($indexPath)).AbsoluteUri
+
+            & $exe.FullName --online-mode --command extension repo-add lumafold_ci --clear-all --name 'LumaFold CI' --directory $cleanExtensions --url $repoUrl --source USER
+            if ($LASTEXITCODE -ne 0) { throw "Blender $version clean repo-add failed" }
+
+            & $exe.FullName --online-mode --command extension install -s -e lumafold
+            if ($LASTEXITCODE -ne 0) { throw "Blender $version clean install failed" }
+
+            $installed = Join-Path $cleanExtensions 'lumafold'
+            $installedManifest = Join-Path $installed 'blender_manifest.toml'
+            $installedVendor = Join-Path $installed 'vendor'
+            if (-not (Test-Path $installedManifest)) { throw "Blender $version installed manifest missing" }
+            if (-not (Test-Path $installedVendor)) { throw "Blender $version bundled runtime missing after install" }
+
+            $probe = Join-Path $env:RUNNER_TEMP "probe-lumafold-$version.py"
+            @"
+          import pathlib
+          import sys
+
+          root = pathlib.Path(r'''$installed''')
+          sys.path.insert(0, str(root.parent))
+          import lumafold
+          from lumafold.runtime.bootstrap import try_import
+          mod = try_import()
+          if mod is None:
+              raise RuntimeError("bundled slimgui import failed")
+          location = pathlib.Path(getattr(mod, "__file__", "")).resolve()
+          vendor = (root / "vendor").resolve()
+          if vendor not in location.parents:
+              raise RuntimeError(f"runtime did not load from package vendor: {location}")
+          print("LUMAFOLD_CLEAN_RUNTIME_OK", location)
+          "@ | Set-Content -Path $probe -Encoding UTF8
+
+            & $exe.FullName --background --factory-startup --python $probe
+            if ($LASTEXITCODE -ne 0) { throw "Blender $version bundled runtime probe failed" }
+
+            Remove-Item Env:BLENDER_USER_CONFIG -ErrorAction SilentlyContinue
+          }
+
+      - name: Publish verified candidate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config user.name 'LumaFold Build Bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add manual/candidates/lumafold-0.8.49-complete-hotfix.zip
+          git add manual/candidates/lumafold-0.8.49-complete-hotfix.zip.sha256.txt
+          if (-not (git status --porcelain)) {
+            Write-Host 'Verified candidate already up to date.'
+            exit 0
+          }
+          git commit -m "candidate: publish verified self-contained 0.8.49 hotfix"
+          git push origin HEAD:main
