@@ -66,24 +66,17 @@ jobs:
           # the child immediately swaps its Object/Sculpt product surface.
           bridge = work / "desktop" / "bridge_server.py"
           btext = bridge.read_text(encoding="utf-8").replace("\r\n", "\n")
-          old = '''            # Satellite already applies the requested UI state locally. Avoid
-              # a redundant full Blender snapshot on every Satellite click; that
-              # snapshot runs Brush/Alpha sync on Blender's main thread.
-              if not satellite_client:
-                  response["state"] = self._snapshot(self.client_name)
-              return response
-          '''
-          new = '''            # Satellite already applies ordinary requested UI state locally.
-              # Keep those writes snapshot-free for first-stroke latency. Mode
-              # transitions are different: the child cannot infer Blender truth,
-              # so return exactly one committed snapshot after synchronous enter/exit.
-              if (not satellite_client) or command_id in {"sculpt.enter", "sculpt.exit_to_object"}:
-                  response["state"] = self._snapshot(self.client_name)
-              return response
-          '''
-          if btext.count(old) != 1:
-              raise SystemExit(f"bridge command response marker count={btext.count(old)}")
-          btext = btext.replace(old, new, 1)
+          cmd_start = btext.index('        if action == "command":')
+          cmd_return = btext.index("            return response", cmd_start)
+          plain_if = btext.rfind("            if not satellite_client:\n", cmd_start, cmd_return)
+          if plain_if < 0:
+              raise SystemExit("Satellite command snapshot gate not found")
+          plain_end = btext.index("            return response", plain_if)
+          gate = (
+              '            if (not satellite_client) or command_id in {"sculpt.enter", "sculpt.exit_to_object"}:\n'
+              '                response["state"] = self._snapshot(self.client_name)\n'
+          )
+          btext = btext[:plain_if] + gate + btext[plain_end:]
           bridge.write_text(btext, encoding="utf-8", newline="\n")
 
           # Syntax gates for touched files.
