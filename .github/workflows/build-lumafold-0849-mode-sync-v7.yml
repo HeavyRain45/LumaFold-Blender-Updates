@@ -1,0 +1,262 @@
+name: Build LumaFold 0.8.49 Mode Sync V7
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-lumafold-0849-mode-sync-v7.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build-test-publish:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout update repository
+        uses: actions/checkout@v4
+
+      - name: Patch V6 with event-driven Satellite mode acknowledgement
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $script = Join-Path $env:RUNNER_TEMP 'patch_v7.py'
+          @'
+          import hashlib
+          import pathlib
+          import shutil
+          import zipfile
+
+          root = pathlib.Path.cwd()
+          source = root / "manual" / "candidates" / "lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v6.zip"
+          output = root / "manual" / "candidates" / "lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v7.zip"
+          sha_file = output.with_suffix(output.suffix + ".sha256.txt")
+          work = pathlib.Path(__import__("os").environ["RUNNER_TEMP"]) / "lumafold_v7_stage"
+
+          if not source.is_file():
+              raise SystemExit(f"source candidate missing: {source}")
+          shutil.rmtree(work, ignore_errors=True)
+          work.mkdir(parents=True)
+          with zipfile.ZipFile(source, "r") as zf:
+              zf.extractall(work)
+
+          # The mode switch itself is already synchronous for Satellite in V5.
+          # Replace its heavy post-command snapshot with a tiny committed-mode ack.
+          bridge = work / "desktop" / "bridge_server.py"
+          text = bridge.read_text(encoding="utf-8").replace("\r\n", "\n")
+          old = '''            if (not satellite_client) or command_id in {"sculpt.enter", "sculpt.exit_to_object"}:
+                  response["state"] = self._snapshot(self.client_name)
+              return response
+          '''
+          new = '''            if satellite_client and command_id in {"sculpt.enter", "sculpt.exit_to_object"}:
+                  # A mode command is special: Satellite cannot infer Blender mode,
+                  # but a full snapshot would run Brush/Alpha sync on the main thread.
+                  # The synchronous mode command has already refreshed APP context,
+                  # so acknowledge only the committed mode/status needed to redraw.
+                  context = APP.state.context
+                  sculpt_status = APP.modules.status("sculpt")
+                  workspace_name = ""
+                  try:
+                      workspace_name = str(getattr(getattr(bpy.context.window, "workspace", None), "name", "") or "")
+                  except Exception:
+                      pass
+                  response["state"] = {
+                      "sculpt_status": {
+                          "active": bool(sculpt_status.active),
+                          "enabled": bool(sculpt_status.enabled),
+                          "reason": str(sculpt_status.reason or ""),
+                          "mode": str(context.mode or ""),
+                          "workspace": workspace_name,
+                      },
+                  }
+              elif not satellite_client:
+                  response["state"] = self._snapshot(self.client_name)
+              return response
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f"V6 mode response block count={text.count(old)}")
+          text = text.replace(old, new, 1)
+          bridge.write_text(text, encoding="utf-8", newline="\n")
+
+          # Immediately latch Blender truth after a successful Satellite mode command,
+          # before the final wire postcondition is enforced. This removes dependence
+          # on the 10 Hz truth timer and closes the exact stale-OBJECT race.
+          auth = work / "runtime" / "satellite_bridge_authority.py"
+          atext = auth.read_text(encoding="utf-8").replace("\r\n", "\n")
+          old_auth = '''    def process_authority(payload):
+              response = _ORIGINAL_PROCESS(payload)
+              client = str((payload or {}).get("client") or bridge.client_name or "")
+              return _enforce_satellite_wire_truth(response, client)
+          '''
+          new_auth = '''    def process_authority(payload):
+              response = _ORIGINAL_PROCESS(payload)
+              client = str((payload or {}).get("client") or bridge.client_name or "")
+              if (
+                  client.startswith("LumaFold Satellite")
+                  and str((payload or {}).get("action") or "") == "command"
+                  and str((payload or {}).get("command_id") or "") in {"sculpt.enter", "sculpt.exit_to_object"}
+                  and isinstance(response, dict)
+                  and bool(response.get("ok"))
+              ):
+                  # The mode command has committed on Blender's main thread.
+                  # Latch truth now; never wait for the periodic truth timer.
+                  publish_context_truth(None)
+              return _enforce_satellite_wire_truth(response, client)
+          '''
+          if atext.count(old_auth) != 1:
+              raise SystemExit(f"process_authority marker count={atext.count(old_auth)}")
+          atext = atext.replace(old_auth, new_auth, 1)
+          auth.write_text(atext, encoding="utf-8", newline="\n")
+
+          compile(bridge.read_text(encoding="utf-8"), str(bridge), "exec")
+          compile(auth.read_text(encoding="utf-8"), str(auth), "exec")
+
+          # Preserve bounded accepted behavior.
+          panels = (work / "panels.py").read_text(encoding="utf-8")
+          if 'row.menu("LUMAFOLD_MT_product_maintenance"' in panels:
+              raise SystemExit("hidden top-right dropdown regressed")
+          satellite = (work / "desktop" / "satellite_host.py").read_text(encoding="utf-8")
+          handoff_slice = satellite[satellite.index("def _wndproc_with_shortcut_capture"):satellite.index("if int(msg) == int(_runtime.WM_APP_SHOW)")]
+          if '_runtime.actions.put({"action": "get_state"})' in handoff_slice:
+              raise SystemExit("first-stroke bounded fix regressed")
+          sculpt_core = (work / "runtime" / "sculpt_input_core.py").read_text(encoding="utf-8")
+          if 'if _host_mode() == "satellite":' not in sculpt_core:
+              raise SystemExit("synchronous Satellite mode transition lost")
+          service = (work / "services" / "blender.py").read_text(encoding="utf-8")
+          if 'object_mode == "SCULPT"' not in service:
+              raise SystemExit("V6 object-mode truth fix lost")
+          launcher = (work / "desktop" / "launcher.py").read_text(encoding="utf-8")
+          if "_active_slimgui_import_root" not in launcher:
+              raise SystemExit("bundled Satellite runtime launch fix lost")
+          manifest = (work / "blender_manifest.toml").read_text(encoding="utf-8")
+          if 'wheels/slimgui-0.8.2-cp312-abi3-win_amd64.whl' not in manifest:
+              raise SystemExit("bundled slimgui manifest entry lost")
+          if not (work / "wheels" / "slimgui-0.8.2-cp312-abi3-win_amd64.whl").is_file():
+              raise SystemExit("bundled slimgui wheel lost")
+
+          output.unlink(missing_ok=True)
+          with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+              for item in sorted(work.rglob("*")):
+                  if item.is_file():
+                      zf.write(item, item.relative_to(work).as_posix())
+
+          digest = hashlib.sha256(output.read_bytes()).hexdigest()
+          sha_file.write_text(f"{digest}  {output.name}\n", encoding="utf-8")
+          print(f"Built {output} ({output.stat().st_size} bytes)")
+          print(f"SHA256 {digest}")
+          '@ | Set-Content -Path $script -Encoding UTF8
+          python $script
+
+      - name: Blender 5.2 exact Satellite command-chain gate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $package = (Resolve-Path "$PWD/manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v7.zip").Path
+
+          foreach ($version in @('5.2.0', '5.2.2')) {
+            $archive = Join-Path $env:RUNNER_TEMP "blender-$version-windows-x64.zip"
+            $blenderRoot = Join-Path $env:RUNNER_TEMP "blender-$version"
+            if (Test-Path $blenderRoot) { Remove-Item $blenderRoot -Recurse -Force }
+            curl.exe -L --fail --retry 3 --retry-delay 2 "https://download.blender.org/release/Blender5.2/blender-$version-windows-x64.zip" -o $archive
+            if ($LASTEXITCODE -ne 0) { throw "Blender $version download failed" }
+            Expand-Archive -Path $archive -DestinationPath $blenderRoot -Force
+            $exe = Get-ChildItem -Path $blenderRoot -Filter blender.exe -Recurse | Select-Object -First 1
+            if (-not $exe) { throw "Blender $version executable not found" }
+
+            & $exe.FullName --command extension validate $package
+            if ($LASTEXITCODE -ne 0) { throw "Blender $version extension validation failed" }
+
+            $cleanRoot = Join-Path $env:RUNNER_TEMP "lumafold-v7-$version"
+            $cleanConfig = Join-Path $cleanRoot "config"
+            $cleanExtensions = Join-Path $cleanRoot "extensions"
+            $localRepo = Join-Path $cleanRoot "repo"
+            if (Test-Path $cleanRoot) { Remove-Item $cleanRoot -Recurse -Force }
+            New-Item -ItemType Directory -Path $cleanConfig -Force | Out-Null
+            New-Item -ItemType Directory -Path $cleanExtensions -Force | Out-Null
+            New-Item -ItemType Directory -Path $localRepo -Force | Out-Null
+            Copy-Item $package (Join-Path $localRepo 'lumafold-0.8.49.zip') -Force
+            & $exe.FullName --command extension server-generate --repo-dir $localRepo --html
+            if ($LASTEXITCODE -ne 0) { throw "repo generation failed" }
+
+            $env:BLENDER_USER_CONFIG = $cleanConfig
+            $indexPath = (Resolve-Path (Join-Path $localRepo 'index.json')).Path
+            $repoUrl = ([System.Uri]::new($indexPath)).AbsoluteUri
+            & $exe.FullName --online-mode --command extension repo-add lumafold_ci --clear-all --name 'LumaFold CI' --directory $cleanExtensions --url $repoUrl --source USER
+            if ($LASTEXITCODE -ne 0) { throw "repo-add failed" }
+            & $exe.FullName --online-mode --command extension install -s -e lumafold
+            if ($LASTEXITCODE -ne 0) { throw "clean install failed" }
+
+            $installed = Join-Path $cleanExtensions 'lumafold'
+            $probe = Join-Path $env:RUNNER_TEMP "probe-mode-chain-$version.py"
+            @"
+          import pathlib
+          import sys
+          import bpy
+
+          root = pathlib.Path(r'''$installed''').resolve()
+          sys.path.insert(0, str(root.parent))
+          import lumafold
+          lumafold.register()
+
+          from lumafold.core.host_control import HOST_CONTROL
+          from lumafold.desktop.bridge_server import BRIDGE
+          from lumafold.core.app import APP
+
+          # Real starting condition: active mesh in Object Mode.
+          bpy.ops.mesh.primitive_uv_sphere_add()
+          obj = bpy.context.view_layer.objects.active
+          assert obj is not None
+          if obj.mode != 'OBJECT':
+              bpy.ops.object.mode_set(mode='OBJECT')
+
+          # Real Satellite ownership so sculpt_input_core takes its synchronous
+          # Satellite-only mode path.
+          lease = HOST_CONTROL.begin_detach()
+          HOST_CONTROL.grant_satellite(lease.generation)
+
+          # Prove the mode command does not call the heavy snapshot path.
+          original_snapshot = BRIDGE._snapshot
+          def forbidden_snapshot(*args, **kwargs):
+              raise RuntimeError('FULL_SNAPSHOT_FORBIDDEN_DURING_SATELLITE_MODE_COMMAND')
+          BRIDGE._snapshot = forbidden_snapshot
+          try:
+              response = BRIDGE._process({
+                  'action': 'command',
+                  'command_id': 'sculpt.enter',
+                  'kwargs': {},
+                  'client': 'LumaFold Satellite CI',
+              })
+          finally:
+              BRIDGE._snapshot = original_snapshot
+
+          assert response.get('ok'), response
+          assert obj.mode == 'SCULPT', f'Blender object mode={obj.mode!r}'
+          assert APP.state.context.mode == 'SCULPT', f'APP mode={APP.state.context.mode!r}'
+          status = dict((response.get('state') or {}).get('sculpt_status') or {})
+          assert status.get('mode') == 'SCULPT', f'wire mode={status!r}'
+
+          # The exact child-side draw predicate must now resolve to Sculpt.
+          can_enter = bool(status.get('enabled', True) and status.get('mode', 'SCULPT') != 'SCULPT')
+          assert can_enter is False, f'child would still show Enter Sculpt: {status!r}'
+
+          print('LUMAFOLD_SATELLITE_MODE_CHAIN_OK', obj.mode, APP.state.context.mode, status.get('mode'))
+          lumafold.unregister()
+          "@ | Set-Content -Path $probe -Encoding UTF8
+
+            & $exe.FullName --background --factory-startup --python $probe
+            if ($LASTEXITCODE -ne 0) { throw "Blender $version exact Satellite mode-chain gate failed" }
+
+            Remove-Item Env:BLENDER_USER_CONFIG -ErrorAction SilentlyContinue
+          }
+
+      - name: Publish verified V7 candidate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config user.name 'LumaFold Build Bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v7.zip
+          git add manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v7.zip.sha256.txt
+          git commit -m "candidate: exact Satellite Sculpt mode acknowledgement"
+          git push origin HEAD:main
