@@ -86,22 +86,23 @@ jobs:
           atext = auth.read_text(encoding="utf-8").replace("\r\n", "\n")
           proc_start = atext.index("    def process_authority(payload):")
           proc_end = atext.index("    bridge._snapshot = snapshot_authority", proc_start)
-          new_auth = '''    def process_authority(payload):
-              response = _ORIGINAL_PROCESS(payload)
-              client = str((payload or {}).get("client") or bridge.client_name or "")
-              if (
-                  client.startswith("LumaFold Satellite")
-                  and str((payload or {}).get("action") or "") == "command"
-                  and str((payload or {}).get("command_id") or "") in {"sculpt.enter", "sculpt.exit_to_object"}
-                  and isinstance(response, dict)
-                  and bool(response.get("ok"))
-              ):
-                  # The mode command has committed on Blender's main thread.
-                  # Latch truth now; never wait for the periodic truth timer.
-                  publish_context_truth(None)
-              return _enforce_satellite_wire_truth(response, client)
-
-          '''
+          new_auth = (
+              '    def process_authority(payload):\n'
+              '        response = _ORIGINAL_PROCESS(payload)\n'
+              '        client = str((payload or {}).get("client") or bridge.client_name or "")\n'
+              '        if (\n'
+              '            client.startswith("LumaFold Satellite")\n'
+              '            and str((payload or {}).get("action") or "") == "command"\n'
+              '            and str((payload or {}).get("command_id") or "") in {"sculpt.enter", "sculpt.exit_to_object"}\n'
+              '            and isinstance(response, dict)\n'
+              '            and bool(response.get("ok"))\n'
+              '        ):\n'
+              '            # The mode command has committed on Blender\'s main thread.\n'
+              '            # Latch truth now; never wait for the periodic truth timer.\n'
+              '            publish_context_truth(None)\n'
+              '        return _enforce_satellite_wire_truth(response, client)\n'
+              '\n'
+          )
           atext = atext[:proc_start] + new_auth + atext[proc_end:]
           auth.write_text(atext, encoding="utf-8", newline="\n")
 
