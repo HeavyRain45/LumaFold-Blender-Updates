@@ -112,61 +112,91 @@ jobs:
           satellite = work / "desktop" / "satellite_host.py"
           text = satellite.read_text(encoding="utf-8")
           start = text.index("def _network_worker_after_first_render():")
-          end = text.index("\ndef _sync_product_extras(", start)
-          old_worker = text[start:end]
-          if "awaiting_grant = False" not in old_worker:
-              old_worker = old_worker.replace(
-                  "    # One preflight snapshot is required before visible-ready.\n    failures = 0\n",
-                  "    # One preflight snapshot is required before visible-ready.\n"
-                  "    # After satellite_ready, Blender grants the Satellite lease asynchronously.\n"
-                  "    # Keep a short startup-only reconcile phase until the child observes that\n"
-                  "    # grant; normal Satellite idle remains fully event-driven afterwards.\n"
-                  "    awaiting_grant = False\n"
-                  "    failures = 0\n",
-                  1,
-              )
-              old_worker = old_worker.replace(
-                  '''            if not _runtime.ready_sent:
-                      response = _runtime.request({"action": "satellite_ready"})
-                      _runtime.ready_sent = bool(response.get("ok"))
-                  else:
-              ''',
-                  '''            if not _runtime.ready_sent:
-                      response = _runtime.request({"action": "satellite_ready"})
-                      _runtime.ready_sent = bool(response.get("ok"))
-                      awaiting_grant = bool(_runtime.ready_sent)
-                  elif awaiting_grant:
-                      # Required handoff handshake only: satellite_ready is answered
-                      # while Blender still owns the DETACHING lease. The Blender-side
-                      # handoff timer grants SATELLITE immediately afterwards, so the
-                      # child must observe that one state transition before it can show
-                      # its hidden HWND. This is not an idle heartbeat.
+          end = text.index("\\ndef _sync_product_extras(", start)
+          fixed_worker = '''def _network_worker_after_first_render():
+              # One preflight snapshot is required before visible-ready.
+              # After satellite_ready, Blender grants the Satellite lease asynchronously.
+              # Keep a short startup-only reconcile phase until the child observes that
+              # grant; normal Satellite idle remains fully event-driven afterwards.
+              awaiting_grant = False
+              failures = 0
+              while not _runtime.closing_event.is_set() and not _initial_state_ready.is_set():
+                  if not _runtime.parent_alive():
+                      return
+                  try:
                       response = _runtime.request({"action": "get_state"})
-                  else:
-              ''',
-                  1,
-              )
-              old_worker = old_worker.replace(
-                  '''                    if bool(hc.get("satellite_active")) and hc.get("owner") == "satellite" and not _runtime.visible and _runtime.hwnd_main:
-                          _runtime.user32.PostMessageW(_runtime.hwnd_main, _runtime.WM_APP_SHOW, 0, 0)
-                  _runtime.connected = True
-              ''',
-                  '''                    if bool(hc.get("satellite_active")) and hc.get("owner") == "satellite":
-                          awaiting_grant = False
-                          if not _runtime.visible and _runtime.hwnd_main:
-                              _runtime.user32.PostMessageW(_runtime.hwnd_main, _runtime.WM_APP_SHOW, 0, 0)
-                  if awaiting_grant:
-                      # Blender's handoff timer normally grants within one or two
-                      # 20 ms ticks; keep this startup reconcile gentle.
-                      _runtime.time.sleep(0.02)
-                  _runtime.connected = True
-              ''',
-                  1,
-              )
-          if "awaiting_grant = False" not in old_worker or "elif awaiting_grant:" not in old_worker:
-              raise SystemExit("Satellite startup grant patch failed")
-          text = text[:start] + old_worker + text[end:]
-          satellite.write_text(text, encoding="utf-8", newline="\n")
+                      if not _apply_preflight_state(response):
+                          raise RuntimeError("Satellite preflight state is incomplete")
+                      break
+                  except Exception:
+                      failures += 1
+                      _runtime.connected = False
+                      _runtime.time.sleep(min(0.04 * failures, 0.25))
+
+              while not _runtime.closing_event.is_set() and not _first_render_ready.wait(0.02):
+                  if not _runtime.parent_alive():
+                      return
+              if _runtime.closing_event.is_set():
+                  return
+
+              # After ready, commands remain event-driven through Queue.get. Idle get_state
+              # is only a 10 Hz watchdog; it is not a source of correctness.
+              failures = 0
+              while not _runtime.closing_event.is_set():
+                  if not _runtime.parent_alive():
+                      if _runtime.hwnd_main:
+                          _runtime.user32.PostMessageW(_runtime.hwnd_main, _runtime.WM_CLOSE, 0, 0)
+                      return
+                  try:
+                      if not _runtime.ready_sent:
+                          response = _runtime.request({"action": "satellite_ready"})
+                          _runtime.ready_sent = bool(response.get("ok"))
+                          awaiting_grant = bool(_runtime.ready_sent)
+                      elif awaiting_grant:
+                          # Required handoff handshake only: satellite_ready is answered
+                          # while Blender still owns the DETACHING lease. The Blender-side
+                          # handoff timer grants SATELLITE immediately afterwards, so the
+                          # child must observe that one state transition before it can show
+                          # its hidden HWND. This is not an idle heartbeat.
+                          response = _runtime.request({"action": "get_state"})
+                      else:
+                          try:
+                              action = _runtime.actions.get(timeout=0.25)
+                          except _runtime.queue.Empty:
+                              # Idle Satellite never wakes Blender. Parent liveness stays
+                              # local to this child process; state reconciliation is queued
+                              # explicitly on Satellite re-entry above.
+                              continue
+                          response = _runtime.request(action)
+                      if not response.get("ok"):
+                          raise RuntimeError(response.get("error") or "bridge request failed")
+                      snapshot = response.get("state")
+                      if isinstance(snapshot, dict) and snapshot:
+                          with _runtime.state_lock:
+                              _runtime.bridge_state = snapshot
+                              hc = snapshot.get("host_control") or {}
+                              if hc.get("owner") == "satellite" and int(hc.get("generation", 0) or 0) > 0:
+                                  _runtime.lease_generation = int(hc.get("generation"))
+                              _runtime._sync_local_from_snapshot(snapshot)
+                              if bool(hc.get("satellite_active")) and hc.get("owner") == "satellite":
+                                  awaiting_grant = False
+                                  if not _runtime.visible and _runtime.hwnd_main:
+                                      _runtime.user32.PostMessageW(_runtime.hwnd_main, _runtime.WM_APP_SHOW, 0, 0)
+                      if awaiting_grant:
+                          # Blender's handoff timer normally grants within one or two
+                          # 20 ms ticks; keep this startup reconcile gentle.
+                          _runtime.time.sleep(0.02)
+                      _runtime.connected = True
+                      failures = 0
+                  except Exception:
+                      _runtime.connected = False
+                      failures += 1
+                      _runtime.time.sleep(min(0.04 * failures, 0.4))
+
+
+          '''
+          text = text[:start] + fixed_worker + text[end:]
+          satellite.write_text(text, encoding="utf-8", newline="\\n")
 
           # Static scope gates: only the intended bundled-runtime/Satellite startup changes.
           launcher_text = launcher.read_text(encoding="utf-8")
