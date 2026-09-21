@@ -193,12 +193,19 @@ jobs:
 
           root = pathlib.Path(r'''$installed''').resolve()
           sys.path.insert(0, str(root.parent))
-          import lumafold
-          lumafold.register()
 
+          # Bootstrap only the business/runtime pieces required by the real
+          # Satellite command path. Avoid UI/WGL registration in headless CI.
+          from lumafold.core.app import APP
+          from lumafold.core.bootstrap import bootstrap_platform
           from lumafold.core.host_control import HOST_CONTROL
           from lumafold.desktop.bridge_server import BRIDGE
-          from lumafold.core.app import APP
+          from lumafold.runtime import sculpt_input_core
+          from lumafold.runtime import satellite_bridge_authority
+
+          bootstrap_platform(APP)
+          sculpt_input_core.configure(APP, None, None, None, None)
+          satellite_bridge_authority.install()
 
           # Real starting condition: active mesh in Object Mode.
           bpy.ops.mesh.primitive_uv_sphere_add()
@@ -206,6 +213,7 @@ jobs:
           assert obj is not None
           if obj.mode != 'OBJECT':
               bpy.ops.object.mode_set(mode='OBJECT')
+          APP.refresh_context(host_id='embedded')
 
           # Real Satellite ownership so sculpt_input_core takes its synchronous
           # Satellite-only mode path.
@@ -233,12 +241,13 @@ jobs:
           status = dict((response.get('state') or {}).get('sculpt_status') or {})
           assert status.get('mode') == 'SCULPT', f'wire mode={status!r}'
 
-          # The exact child-side draw predicate must now resolve to Sculpt.
+          # This is the exact predicate used by the Satellite draw loop.
           can_enter = bool(status.get('enabled', True) and status.get('mode', 'SCULPT') != 'SCULPT')
           assert can_enter is False, f'child would still show Enter Sculpt: {status!r}'
 
           print('LUMAFOLD_SATELLITE_MODE_CHAIN_OK', obj.mode, APP.state.context.mode, status.get('mode'))
-          lumafold.unregister()
+          satellite_bridge_authority.uninstall()
+          sculpt_input_core.unregister()
           "@ | Set-Content -Path $probe -Encoding UTF8
 
             & $exe.FullName --background --factory-startup --python $probe
