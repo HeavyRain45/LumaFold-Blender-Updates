@@ -194,18 +194,15 @@ jobs:
           root = pathlib.Path(r'''$installed''').resolve()
           sys.path.insert(0, str(root.parent))
 
-          # Bootstrap only the business/runtime pieces required by the real
-          # Satellite command path. Avoid UI/WGL registration in headless CI.
-          from lumafold.core.app import APP
-          from lumafold.core.bootstrap import bootstrap_platform
+          # Run the actual extension registration in a real Blender UI process.
+          # Background mode is intentionally avoided because LumaFold's Win32/WGL
+          # runtime is not valid in Blender --background.
+          import lumafold
+          lumafold.register()
+
           from lumafold.core.host_control import HOST_CONTROL
           from lumafold.desktop.bridge_server import BRIDGE
-          from lumafold.runtime import sculpt_input_core
-          from lumafold.runtime import satellite_bridge_authority
-
-          bootstrap_platform(APP)
-          sculpt_input_core.configure(APP, None, None, None, None)
-          satellite_bridge_authority.install()
+          from lumafold.core.app import APP
 
           # Real starting condition: active mesh in Object Mode.
           bpy.ops.mesh.primitive_uv_sphere_add()
@@ -246,11 +243,11 @@ jobs:
           assert can_enter is False, f'child would still show Enter Sculpt: {status!r}'
 
           print('LUMAFOLD_SATELLITE_MODE_CHAIN_OK', obj.mode, APP.state.context.mode, status.get('mode'))
-          satellite_bridge_authority.uninstall()
-          sculpt_input_core.unregister()
+          lumafold.unregister()
+          bpy.ops.wm.quit_blender()
           "@ | Set-Content -Path $probe -Encoding UTF8
 
-            & $exe.FullName --background --factory-startup --python $probe
+            & $exe.FullName --factory-startup --python $probe
             if ($LASTEXITCODE -ne 0) { throw "Blender $version exact Satellite mode-chain gate failed" }
 
             Remove-Item Env:BLENDER_USER_CONFIG -ErrorAction SilentlyContinue
