@@ -164,27 +164,19 @@ jobs:
             & $exe.FullName --command extension validate $package
             if ($LASTEXITCODE -ne 0) { throw "Blender $version extension validation failed" }
 
+            # Do not install/enable the extension for this headless probe:
+            # extension auto-load initializes Win32/WGL, which is invalid in
+            # Blender --background. Extract the validated ZIP and import only the
+            # business/runtime modules through a package stub below.
             $cleanRoot = Join-Path $env:RUNNER_TEMP "lumafold-v7-$version"
             $cleanConfig = Join-Path $cleanRoot "config"
-            $cleanExtensions = Join-Path $cleanRoot "extensions"
-            $localRepo = Join-Path $cleanRoot "repo"
+            $installed = Join-Path $cleanRoot "source"
             if (Test-Path $cleanRoot) { Remove-Item $cleanRoot -Recurse -Force }
             New-Item -ItemType Directory -Path $cleanConfig -Force | Out-Null
-            New-Item -ItemType Directory -Path $cleanExtensions -Force | Out-Null
-            New-Item -ItemType Directory -Path $localRepo -Force | Out-Null
-            Copy-Item $package (Join-Path $localRepo 'lumafold-0.8.49.zip') -Force
-            & $exe.FullName --command extension server-generate --repo-dir $localRepo --html
-            if ($LASTEXITCODE -ne 0) { throw "repo generation failed" }
-
+            New-Item -ItemType Directory -Path $installed -Force | Out-Null
+            Expand-Archive -Path $package -DestinationPath $installed -Force
             $env:BLENDER_USER_CONFIG = $cleanConfig
-            $indexPath = (Resolve-Path (Join-Path $localRepo 'index.json')).Path
-            $repoUrl = ([System.Uri]::new($indexPath)).AbsoluteUri
-            & $exe.FullName --online-mode --command extension repo-add lumafold_ci --clear-all --name 'LumaFold CI' --directory $cleanExtensions --url $repoUrl --source USER
-            if ($LASTEXITCODE -ne 0) { throw "repo-add failed" }
-            & $exe.FullName --online-mode --command extension install -s -e lumafold
-            if ($LASTEXITCODE -ne 0) { throw "clean install failed" }
 
-            $installed = Join-Path $cleanExtensions 'lumafold'
             $probe = Join-Path $env:RUNNER_TEMP "probe-mode-chain-$version.py"
             @"
           import pathlib
