@@ -1,0 +1,271 @@
+name: Build LumaFold 0.8.49 Self-Contained Satellite V2
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build-lumafold-0849-self-contained-satellite-v2.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build-test-publish:
+    runs-on: windows-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout update repository
+        uses: actions/checkout@v4
+
+      - name: Patch bundled-runtime Satellite candidate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $script = Join-Path $env:RUNNER_TEMP 'build_lumafold_satellite_v2.py'
+          @'
+          import hashlib
+          import pathlib
+          import shutil
+          import zipfile
+
+          root = pathlib.Path.cwd()
+          source = root / "manual" / "candidates" / "lumafold-0.8.49-install-ready-satellite-hotfix.zip"
+          output = root / "manual" / "candidates" / "lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v2.zip"
+          sha_file = output.with_suffix(output.suffix + ".sha256.txt")
+          work = pathlib.Path(__import__("os").environ["RUNNER_TEMP"]) / "lumafold_satellite_v2_stage"
+
+          if not source.is_file():
+              raise SystemExit(f"source candidate missing: {source}")
+
+          shutil.rmtree(work, ignore_errors=True)
+          work.mkdir(parents=True)
+          with zipfile.ZipFile(source, "r") as zf:
+              zf.extractall(work)
+
+          manifest_path = work / "blender_manifest.toml"
+          manifest = manifest_path.read_text(encoding="utf-8")
+          if 'version = "0.8.49"' not in manifest:
+              raise SystemExit("unexpected source version")
+          if 'blender_version_min = "5.2.0"' not in manifest:
+              raise SystemExit("unexpected Blender minimum")
+          wheel_rel = "wheels/slimgui-0.8.2-cp312-abi3-win_amd64.whl"
+          if wheel_rel not in manifest:
+              raise SystemExit("manifest does not declare bundled slimgui wheel")
+          if not (work / wheel_rel).is_file():
+              raise SystemExit("bundled slimgui wheel missing from ZIP")
+
+          launcher = work / "desktop" / "launcher.py"
+          text = launcher.read_text(encoding="utf-8")
+          marker = '''def _satellite_child_env() -> dict:
+          '''
+          helper = '''def _active_slimgui_import_root() -> Path:
+              """Return the import root Blender is actually using for slimgui.
+
+              Clean 0.8.49 installs can receive slimgui from the extension manifest wheel,
+              while older profiles may still use the CONFIG/vendor runtime. Satellite is
+              a standalone Python child, so it must receive the real active import root
+              explicitly instead of assuming the legacy vendor directory owns slimgui.
+              """
+              try:
+                  import slimgui
+                  module_file = Path(slimgui.__file__).resolve()
+                  if module_file.name.lower() == "__init__.py":
+                      return module_file.parent.parent
+                  return module_file.parent
+              except Exception:
+                  return vendor_dir()
+
+
+          def _satellite_child_env() -> dict:
+          '''
+          if "_active_slimgui_import_root" not in text:
+              if marker not in text:
+                  raise SystemExit("launcher insertion marker not found")
+              text = text.replace(marker, helper, 1)
+
+          old_paths = '''    env = dict(os.environ)
+              paths = [str(vendor_dir())]
+          '''
+          new_paths = '''    env = dict(os.environ)
+              active_runtime = _active_slimgui_import_root()
+              paths = [str(active_runtime)]
+              legacy_vendor = str(vendor_dir())
+              if legacy_vendor not in paths:
+                  paths.append(legacy_vendor)
+          '''
+          if "active_runtime = _active_slimgui_import_root()" not in text:
+              if old_paths not in text:
+                  raise SystemExit("launcher PYTHONPATH block not found")
+              text = text.replace(old_paths, new_paths, 1)
+
+          old_arg = '"--runtime-path", str(vendor_dir()),'
+          new_arg = '"--runtime-path", str(_active_slimgui_import_root()),'
+          if new_arg not in text:
+              if old_arg not in text:
+                  raise SystemExit("launcher runtime-path argument not found")
+              text = text.replace(old_arg, new_arg, 1)
+          launcher.write_text(text, encoding="utf-8", newline="\n")
+
+          satellite = work / "desktop" / "satellite_host.py"
+          text = satellite.read_text(encoding="utf-8")
+          start = text.index("def _network_worker_after_first_render():")
+          end = text.index("\ndef _sync_product_extras(", start)
+          old_worker = text[start:end]
+          if "awaiting_grant = False" not in old_worker:
+              old_worker = old_worker.replace(
+                  "    # One preflight snapshot is required before visible-ready.\n    failures = 0\n",
+                  "    # One preflight snapshot is required before visible-ready.\n"
+                  "    # After satellite_ready, Blender grants the Satellite lease asynchronously.\n"
+                  "    # Keep a short startup-only reconcile phase until the child observes that\n"
+                  "    # grant; normal Satellite idle remains fully event-driven afterwards.\n"
+                  "    awaiting_grant = False\n"
+                  "    failures = 0\n",
+                  1,
+              )
+              old_worker = old_worker.replace(
+                  '''            if not _runtime.ready_sent:
+                      response = _runtime.request({"action": "satellite_ready"})
+                      _runtime.ready_sent = bool(response.get("ok"))
+                  else:
+              ''',
+                  '''            if not _runtime.ready_sent:
+                      response = _runtime.request({"action": "satellite_ready"})
+                      _runtime.ready_sent = bool(response.get("ok"))
+                      awaiting_grant = bool(_runtime.ready_sent)
+                  elif awaiting_grant:
+                      # Required handoff handshake only: satellite_ready is answered
+                      # while Blender still owns the DETACHING lease. The Blender-side
+                      # handoff timer grants SATELLITE immediately afterwards, so the
+                      # child must observe that one state transition before it can show
+                      # its hidden HWND. This is not an idle heartbeat.
+                      response = _runtime.request({"action": "get_state"})
+                  else:
+              ''',
+                  1,
+              )
+              old_worker = old_worker.replace(
+                  '''                    if bool(hc.get("satellite_active")) and hc.get("owner") == "satellite" and not _runtime.visible and _runtime.hwnd_main:
+                          _runtime.user32.PostMessageW(_runtime.hwnd_main, _runtime.WM_APP_SHOW, 0, 0)
+                  _runtime.connected = True
+              ''',
+                  '''                    if bool(hc.get("satellite_active")) and hc.get("owner") == "satellite":
+                          awaiting_grant = False
+                          if not _runtime.visible and _runtime.hwnd_main:
+                              _runtime.user32.PostMessageW(_runtime.hwnd_main, _runtime.WM_APP_SHOW, 0, 0)
+                  if awaiting_grant:
+                      # Blender's handoff timer normally grants within one or two
+                      # 20 ms ticks; keep this startup reconcile gentle.
+                      _runtime.time.sleep(0.02)
+                  _runtime.connected = True
+              ''',
+                  1,
+              )
+          if "awaiting_grant = False" not in old_worker or "elif awaiting_grant:" not in old_worker:
+              raise SystemExit("Satellite startup grant patch failed")
+          text = text[:start] + old_worker + text[end:]
+          satellite.write_text(text, encoding="utf-8", newline="\n")
+
+          # Static scope gates: only the intended bundled-runtime/Satellite startup changes.
+          launcher_text = launcher.read_text(encoding="utf-8")
+          satellite_text = satellite.read_text(encoding="utf-8")
+          if "_active_slimgui_import_root" not in launcher_text:
+              raise SystemExit("active bundled runtime resolver missing")
+          if '"--runtime-path", str(_active_slimgui_import_root()),' not in launcher_text:
+              raise SystemExit("Satellite runtime-path is not using active bundled runtime")
+          if "awaiting_grant = False" not in satellite_text or 'response = _runtime.request({"action": "get_state"})' not in satellite_text:
+              raise SystemExit("Satellite startup lease reconcile missing")
+
+          output.unlink(missing_ok=True)
+          with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+              for item in sorted(work.rglob("*")):
+                  if item.is_file():
+                      zf.write(item, item.relative_to(work).as_posix())
+
+          digest = hashlib.sha256(output.read_bytes()).hexdigest()
+          sha_file.write_text(f"{digest}  {output.name}\n", encoding="utf-8")
+          print(f"Built {output} ({output.stat().st_size} bytes)")
+          print(f"SHA256 {digest}")
+          '@ | Set-Content -Path $script -Encoding UTF8
+          python $script
+
+      - name: Clean install and bundled runtime gates
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $package = (Resolve-Path "$PWD/manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v2.zip").Path
+
+          foreach ($version in @('5.2.0', '5.2.2')) {
+            Write-Host "=== Blender $version clean-install gate ==="
+            $archive = Join-Path $env:RUNNER_TEMP "blender-$version-windows-x64.zip"
+            $blenderRoot = Join-Path $env:RUNNER_TEMP "blender-$version"
+            if (Test-Path $blenderRoot) { Remove-Item $blenderRoot -Recurse -Force }
+
+            curl.exe -L --fail --retry 3 --retry-delay 2 "https://download.blender.org/release/Blender5.2/blender-$version-windows-x64.zip" -o $archive
+            if ($LASTEXITCODE -ne 0) { throw "Blender $version download failed" }
+            Expand-Archive -Path $archive -DestinationPath $blenderRoot -Force
+            $exe = Get-ChildItem -Path $blenderRoot -Filter blender.exe -Recurse | Select-Object -First 1
+            if (-not $exe) { throw "Blender $version executable not found" }
+
+            & $exe.FullName --command extension validate $package
+            if ($LASTEXITCODE -ne 0) { throw "Blender $version extension validation failed" }
+
+            $cleanRoot = Join-Path $env:RUNNER_TEMP "lumafold-sat-v2-$version"
+            $cleanConfig = Join-Path $cleanRoot "config"
+            $cleanExtensions = Join-Path $cleanRoot "extensions"
+            $localRepo = Join-Path $cleanRoot "repo"
+            if (Test-Path $cleanRoot) { Remove-Item $cleanRoot -Recurse -Force }
+            New-Item -ItemType Directory -Path $cleanConfig -Force | Out-Null
+            New-Item -ItemType Directory -Path $cleanExtensions -Force | Out-Null
+            New-Item -ItemType Directory -Path $localRepo -Force | Out-Null
+            Copy-Item $package (Join-Path $localRepo 'lumafold-0.8.49.zip') -Force
+
+            & $exe.FullName --command extension server-generate --repo-dir $localRepo --html
+            if ($LASTEXITCODE -ne 0) { throw "Blender $version local repository generation failed" }
+
+            $env:BLENDER_USER_CONFIG = $cleanConfig
+            $indexPath = (Resolve-Path (Join-Path $localRepo 'index.json')).Path
+            $repoUrl = ([System.Uri]::new($indexPath)).AbsoluteUri
+
+            & $exe.FullName --online-mode --command extension repo-add lumafold_ci --clear-all --name 'LumaFold CI' --directory $cleanExtensions --url $repoUrl --source USER
+            if ($LASTEXITCODE -ne 0) { throw "Blender $version clean repo-add failed" }
+            & $exe.FullName --online-mode --command extension install -s -e lumafold
+            if ($LASTEXITCODE -ne 0) { throw "Blender $version clean install failed" }
+
+            $installed = Join-Path $cleanExtensions 'lumafold'
+            $probe = Join-Path $env:RUNNER_TEMP "probe-lumafold-sat-v2-$version.py"
+            @"
+          import pathlib
+          import slimgui
+          import sys
+
+          root = pathlib.Path(r'''$installed''').resolve()
+          sys.path.insert(0, str(root.parent))
+          import lumafold
+          from lumafold.desktop.launcher import _active_slimgui_import_root
+
+          slimgui_file = pathlib.Path(slimgui.__file__).resolve()
+          active_root = pathlib.Path(_active_slimgui_import_root()).resolve()
+          if active_root not in (slimgui_file.parent, slimgui_file.parent.parent):
+              raise RuntimeError(f"active Satellite runtime root mismatch: {active_root} vs {slimgui_file}")
+          print("LUMAFOLD_SATELLITE_BUNDLED_RUNTIME_OK", active_root)
+          "@ | Set-Content -Path $probe -Encoding UTF8
+
+            & $exe.FullName --background --factory-startup --python $probe
+            if ($LASTEXITCODE -ne 0) { throw "Blender $version Satellite bundled runtime probe failed" }
+
+            Remove-Item Env:BLENDER_USER_CONFIG -ErrorAction SilentlyContinue
+          }
+
+      - name: Publish verified V2 candidate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config user.name 'LumaFold Build Bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v2.zip
+          git add manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v2.zip.sha256.txt
+          git commit -m "candidate: publish self-contained Satellite first-stroke hotfix v2"
+          git push origin HEAD:main
