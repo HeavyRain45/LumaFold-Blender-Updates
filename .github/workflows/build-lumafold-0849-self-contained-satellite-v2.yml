@@ -112,7 +112,7 @@ jobs:
           satellite = work / "desktop" / "satellite_host.py"
           text = satellite.read_text(encoding="utf-8")
           start = text.index("def _network_worker_after_first_render():")
-          end = text.index("\\ndef _sync_product_extras(", start)
+          end = text.index("\ndef _sync_product_extras(", start)
           fixed_worker = '''def _network_worker_after_first_render():
               # One preflight snapshot is required before visible-ready.
               # After satellite_ready, Blender grants the Satellite lease asynchronously.
@@ -196,7 +196,7 @@ jobs:
 
           '''
           text = text[:start] + fixed_worker + text[end:]
-          satellite.write_text(text, encoding="utf-8", newline="\\n")
+          satellite.write_text(text, encoding="utf-8", newline="\n")
 
           # Static scope gates: only the intended bundled-runtime/Satellite startup changes.
           launcher_text = launcher.read_text(encoding="utf-8")
