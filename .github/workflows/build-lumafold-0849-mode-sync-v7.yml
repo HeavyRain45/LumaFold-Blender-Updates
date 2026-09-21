@@ -45,11 +45,13 @@ jobs:
           # Replace its heavy post-command snapshot with a tiny committed-mode ack.
           bridge = work / "desktop" / "bridge_server.py"
           text = bridge.read_text(encoding="utf-8").replace("\r\n", "\n")
-          old = '''            if (not satellite_client) or command_id in {"sculpt.enter", "sculpt.exit_to_object"}:
-                  response["state"] = self._snapshot(self.client_name)
-              return response
-          '''
-          new = '''            if satellite_client and command_id in {"sculpt.enter", "sculpt.exit_to_object"}:
+          cmd_start = text.index('        if action == "command":')
+          gate_start = text.index(
+              '            if (not satellite_client) or command_id in {"sculpt.enter", "sculpt.exit_to_object"}:',
+              cmd_start,
+          )
+          gate_return = text.index("            return response", gate_start)
+          new_gate = '''            if satellite_client and command_id in {"sculpt.enter", "sculpt.exit_to_object"}:
                   # A mode command is special: Satellite cannot infer Blender mode,
                   # but a full snapshot would run Brush/Alpha sync on the main thread.
                   # The synchronous mode command has already refreshed APP context,
@@ -72,11 +74,8 @@ jobs:
                   }
               elif not satellite_client:
                   response["state"] = self._snapshot(self.client_name)
-              return response
           '''
-          if text.count(old) != 1:
-              raise SystemExit(f"V6 mode response block count={text.count(old)}")
-          text = text.replace(old, new, 1)
+          text = text[:gate_start] + new_gate + text[gate_return:]
           bridge.write_text(text, encoding="utf-8", newline="\n")
 
           # Immediately latch Blender truth after a successful Satellite mode command,
