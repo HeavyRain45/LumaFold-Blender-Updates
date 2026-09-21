@@ -47,29 +47,18 @@ jobs:
           # Satellite button click.
           sculpt_core = work / "runtime" / "sculpt_input_core.py"
           text = sculpt_core.read_text(encoding="utf-8").replace("\r\n", "\n")
-          marker = '''        try:
-              bpy.app.timers.register(run, first_interval=0.01)
-          except Exception:
-              run()
-          return label + " · 已请求"
-          '''
-          replacement = '''        if _host_mode() == "satellite":
-              # Satellite commands are already dispatched on Blender's main-thread
-              # bridge timer, so deferring again creates a stale window where Blender
-              # has not committed the mode yet but the child already rendered the
-              # old UI. Complete this one mode transition in the current bridge tick.
-              run()
-              return str(state.get("mode_request_status") or (label + " · 完成"))
-
-          try:
-              bpy.app.timers.register(run, first_interval=0.01)
-          except Exception:
-              run()
-          return label + " · 已请求"
-          '''
-          if text.count(marker) != 1:
-              raise SystemExit(f"Satellite mode queue marker count={text.count(marker)}")
-          text = text.replace(marker, replacement, 1)
+          timer_line = '            bpy.app.timers.register(run, first_interval=0.01)\n'
+          timer_pos = text.index(timer_line)
+          sat_block = (
+              '        if _host_mode() == "satellite":\n'
+              '            # Satellite commands are already dispatched on Blender\'s main-thread\n'
+              '            # bridge timer. Complete only this mode transition now so\n'
+              '            # no second timer is left pending behind the child UI.\n'
+              '            run()\n'
+              '            return str(state.get("mode_request_status") or (label + " · 完成"))\n'
+              '\n'
+          )
+          text = text[:timer_pos-8] + sat_block + text[timer_pos-8:]
           sculpt_core.write_text(text, encoding="utf-8", newline="\n")
 
           # 2) Ordinary Satellite commands remain snapshot-free for first-stroke
