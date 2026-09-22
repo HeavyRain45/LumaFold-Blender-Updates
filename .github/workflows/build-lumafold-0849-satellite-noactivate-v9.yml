@@ -1,0 +1,202 @@
+name: Build LumaFold 0.8.49 Satellite NoActivate V9
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-lumafold-0849-satellite-noactivate-v9.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build-test-publish:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout update repository
+        uses: actions/checkout@v4
+
+      - name: Patch V8 with Win32 no-activate Satellite windows
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $script = Join-Path $env:RUNNER_TEMP 'patch_v9.py'
+          @'
+          import hashlib
+          import pathlib
+          import shutil
+          import zipfile
+
+          root = pathlib.Path.cwd()
+          source = root / "manual" / "candidates" / "lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v8.zip"
+          output = root / "manual" / "candidates" / "lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v9.zip"
+          sha_file = output.with_suffix(output.suffix + ".sha256.txt")
+          work = pathlib.Path(__import__("os").environ["RUNNER_TEMP"]) / "lumafold_v9_stage"
+
+          if not source.is_file():
+              raise SystemExit(f"source candidate missing: {source}")
+          shutil.rmtree(work, ignore_errors=True)
+          work.mkdir(parents=True)
+          with zipfile.ZipFile(source, "r") as zf:
+              zf.extractall(work)
+
+          # Main Satellite HWND: make non-activation a real Win32 window-style
+          # contract, not only a WM_MOUSEACTIVATE convention.
+          sat_runtime = work / "desktop" / "satellite_host_runtime.py"
+          text = sat_runtime.read_text(encoding="utf-8").replace("\r\n", "\n")
+          if "WS_EX_NOACTIVATE = 0x08000000" not in text:
+              marker = "WS_POPUP = 0x80000000\n"
+              if marker not in text:
+                  raise SystemExit("Satellite WS_POPUP marker missing")
+              text = text.replace(marker, marker + "WS_EX_NOACTIVATE = 0x08000000\n", 1)
+
+          old_create = '''    hwnd_main = user32.CreateWindowExW(
+                  0, class_name, "LumaFold Sculpt · 卫星",
+                  WS_POPUP,
+          '''
+          new_create = '''    hwnd_main = user32.CreateWindowExW(
+                  WS_EX_NOACTIVATE, class_name, "LumaFold Sculpt · 卫星",
+                  WS_POPUP,
+          '''
+          if old_create not in text and new_create not in text:
+              raise SystemExit("Satellite CreateWindowEx block missing")
+          text = text.replace(old_create, new_create, 1)
+
+          # The runtime's WM_APP_SHOW path used SW_SHOW, which explicitly activates
+          # the window. Keep every show path non-activating.
+          old_show = '''    if msg == WM_APP_SHOW:
+                  if not visible:
+                      user32.ShowWindow(hwnd, SW_SHOW)
+                      user32.UpdateWindow(hwnd)
+                      visible = True
+                  return 0
+          '''
+          new_show = '''    if msg == WM_APP_SHOW:
+                  if not visible:
+                      user32.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
+                      user32.UpdateWindow(hwnd)
+                      visible = True
+                  return 0
+          '''
+          if old_show not in text and new_show not in text:
+              raise SystemExit("Satellite WM_APP_SHOW block missing")
+          text = text.replace(old_show, new_show, 1)
+          compile(text, str(sat_runtime), "exec")
+          sat_runtime.write_text(text, encoding="utf-8", newline="\n")
+
+          # Secondary Satellite surfaces (Brush Library / Alpha / etc.) must obey
+          # the same no-activate contract, otherwise they can reintroduce the exact
+          # focus handoff on the next sculpt stroke.
+          secondary = work / "desktop" / "secondary_surface_host_runtime.py"
+          stext = secondary.read_text(encoding="utf-8").replace("\r\n", "\n")
+          if "WS_EX_NOACTIVATE = 0x08000000" not in stext:
+              marker = "WS_POPUP = 0x80000000\n"
+              if marker not in stext:
+                  raise SystemExit("Secondary WS_POPUP marker missing")
+              stext = stext.replace(marker, marker + "WS_EX_NOACTIVATE = 0x08000000\n", 1)
+
+          old_secondary = '''    hwnd_main = user32.CreateWindowExW(
+                  0, class_name, "LumaFold Secondary Surface", WS_POPUP,
+          '''
+          new_secondary = '''    hwnd_main = user32.CreateWindowExW(
+                  WS_EX_NOACTIVATE, class_name, "LumaFold Secondary Surface", WS_POPUP,
+          '''
+          if old_secondary not in stext and new_secondary not in stext:
+              raise SystemExit("Secondary CreateWindowEx block missing")
+          stext = stext.replace(old_secondary, new_secondary, 1)
+          compile(stext, str(secondary), "exec")
+          secondary.write_text(stext, encoding="utf-8", newline="\n")
+
+          # Static gates: ordinary Satellite pointer interaction remains MA_NOACTIVATE,
+          # and explicit shortcut capture can still call SetForegroundWindow.
+          sat_host = (work / "desktop" / "satellite_host.py").read_text(encoding="utf-8")
+          if "return MA_NOACTIVATE" not in sat_host:
+              raise SystemExit("Satellite WM_MOUSEACTIVATE no-activate policy lost")
+          if "SetForegroundWindow(_runtime.hwnd_main)" not in sat_host:
+              raise SystemExit("explicit shortcut-capture foreground path lost")
+
+          # Preserve accepted V7/V8 product behavior.
+          panels = (work / "panels.py").read_text(encoding="utf-8")
+          if "class LUMAFOLD_Preferences" not in panels:
+              raise SystemExit("V8 preferences diagnostics entry lost")
+          if 'row.menu("LUMAFOLD_MT_product_maintenance"' in panels[panels.index("def _draw_lumafold_header"):]:
+              raise SystemExit("top-right maintenance dropdown regressed")
+          bridge = (work / "desktop" / "bridge_server.py").read_text(encoding="utf-8")
+          if 'satellite_client and command_id in {"sculpt.enter", "sculpt.exit_to_object"}' not in bridge:
+              raise SystemExit("V7 mode-sync transport lost")
+          launcher = (work / "desktop" / "launcher.py").read_text(encoding="utf-8")
+          if "_active_slimgui_import_root" not in launcher:
+              raise SystemExit("bundled runtime launch fix lost")
+          manifest = (work / "blender_manifest.toml").read_text(encoding="utf-8")
+          if 'wheels/slimgui-0.8.2-cp312-abi3-win_amd64.whl' not in manifest:
+              raise SystemExit("bundled slimgui manifest entry lost")
+          if not (work / "wheels" / "slimgui-0.8.2-cp312-abi3-win_amd64.whl").is_file():
+              raise SystemExit("bundled slimgui wheel lost")
+
+          output.unlink(missing_ok=True)
+          with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+              for item in sorted(work.rglob("*")):
+                  if item.is_file():
+                      zf.write(item, item.relative_to(work).as_posix())
+
+          digest = hashlib.sha256(output.read_bytes()).hexdigest()
+          sha_file.write_text(f"{digest}  {output.name}\n", encoding="utf-8")
+          print(f"Built {output} ({output.stat().st_size} bytes)")
+          print(f"SHA256 {digest}")
+          '@ | Set-Content -Path $script -Encoding UTF8
+          python $script
+
+      - name: Static no-activate contract gate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $package = (Resolve-Path "$PWD/manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v9.zip").Path
+          $stage = Join-Path $env:RUNNER_TEMP 'lumafold-v9-contract'
+          if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+          Expand-Archive -Path $package -DestinationPath $stage -Force
+          $check = Join-Path $env:RUNNER_TEMP 'check_v9.py'
+          @"
+          import pathlib
+          root = pathlib.Path(r'''$stage''')
+          main = (root / 'desktop' / 'satellite_host_runtime.py').read_text(encoding='utf-8')
+          sec = (root / 'desktop' / 'secondary_surface_host_runtime.py').read_text(encoding='utf-8')
+          host = (root / 'desktop' / 'satellite_host.py').read_text(encoding='utf-8')
+          assert 'WS_EX_NOACTIVATE = 0x08000000' in main
+          assert 'WS_EX_NOACTIVATE, class_name, "LumaFold Sculpt · 卫星"' in main
+          assert 'user32.ShowWindow(hwnd, SW_SHOWNOACTIVATE)' in main
+          assert 'WS_EX_NOACTIVATE = 0x08000000' in sec
+          assert 'WS_EX_NOACTIVATE, class_name, "LumaFold Secondary Surface", WS_POPUP' in sec
+          assert 'return MA_NOACTIVATE' in host
+          assert 'SetForegroundWindow(_runtime.hwnd_main)' in host
+          print('LUMAFOLD_V9_NOACTIVATE_CONTRACT_OK')
+          "@ | Set-Content -Path $check -Encoding UTF8
+          python $check
+          if ($LASTEXITCODE -ne 0) { throw "V9 no-activate contract failed" }
+
+      - name: Blender 5.2.2 extension validation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $package = (Resolve-Path "$PWD/manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v9.zip").Path
+          $version = '5.2.2'
+          $archive = Join-Path $env:RUNNER_TEMP "blender-$version-windows-x64.zip"
+          $blenderRoot = Join-Path $env:RUNNER_TEMP "blender-$version"
+          curl.exe -L --fail --retry 3 --retry-delay 2 "https://download.blender.org/release/Blender5.2/blender-$version-windows-x64.zip" -o $archive
+          if ($LASTEXITCODE -ne 0) { throw "Blender download failed" }
+          Expand-Archive -Path $archive -DestinationPath $blenderRoot -Force
+          $exe = Get-ChildItem -Path $blenderRoot -Filter blender.exe -Recurse | Select-Object -First 1
+          if (-not $exe) { throw "Blender executable not found" }
+          & $exe.FullName --command extension validate $package
+          if ($LASTEXITCODE -ne 0) { throw "extension validation failed" }
+
+      - name: Publish verified V9 candidate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config user.name 'LumaFold Build Bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v9.zip
+          git add manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v9.zip.sha256.txt
+          git commit -m "candidate: keep Satellite HWNDs non-activating"
+          git push origin HEAD:main
