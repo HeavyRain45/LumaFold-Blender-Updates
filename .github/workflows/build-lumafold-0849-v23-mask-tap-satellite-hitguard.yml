@@ -1,0 +1,503 @@
+name: Build LumaFold 0.8.49 V23 Mask Tap + Satellite Hit Guard
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build-lumafold-0849-v23-mask-tap-satellite-hitguard.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch V22
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $py = Join-Path $env:RUNNER_TEMP 'v23.py'
+          @'
+          import pathlib, zipfile, shutil, hashlib, os
+
+          root = pathlib.Path.cwd()
+          src = root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v22-ctrl-mask-click-satellite.zip'
+          out = root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v23-mask-tap-satellite-hitguard.zip'
+          work = pathlib.Path(os.environ['RUNNER_TEMP'])/'lf_v23'
+          shutil.rmtree(work, ignore_errors=True)
+          work.mkdir(parents=True)
+          with zipfile.ZipFile(src) as z:
+              z.extractall(work)
+
+          # ==============================================================
+          # 1) Restore the old ZBrush-style tap semantics without regressing
+          #    V21/V22's reliable native brush-tool handoff:
+          #
+          #    Ctrl + surface TAP      -> Smooth/Feather Mask
+          #    Ctrl+Alt + surface TAP  -> Sharpen Mask
+          #    Ctrl + background TAP   -> Invert Mask
+          #    Ctrl + surface DRAG     -> native Mask Brush
+          #    Ctrl(+Alt)+bg DRAG      -> selected native Mask gesture
+          #
+          #    Drag surface/background ownership is decided by Blender itself:
+          #    native Mask brush RUNNING_MODAL = surface,
+          #    PASS_THROUGH = background.
+          # ==============================================================
+          tool = work/'runtime/sculpt_mask_tool_bridge.py'
+          t = tool.read_text(encoding='utf-8').replace('\r\n','\n')
+
+          if 'def ctrl_session_ensure(context=None) -> dict:' not in t:
+              anchor = 'def gesture_begin(context=None) -> dict:\n'
+              helper = (
+                  'def ctrl_session_ensure(context=None) -> dict:\n'
+                  '    """Repair Ctrl-session truth from a live Ctrl+LMB event.\n'
+                  '\n'
+                  '    Satellite is non-activating by design, so Windows can occasionally\n'
+                  '    omit the standalone Ctrl keydown before the first pen press. The\n'
+                  '    pointer event still carries Ctrl truth; use it as the authoritative\n'
+                  '    session repair signal.\n'
+                  '    """\n'
+                  '    workspace = _workspace(context)\n'
+                  '    if workspace is None:\n'
+                  '        return {"session_active": False, "tool_id": BOX_TOOL_ID}\n'
+                  '    state = _state(workspace)\n'
+                  '    state["ctrl_held"] = True\n'
+                  '    if not state.get("session_active"):\n'
+                  '        info = session_begin(context)\n'
+                  '    else:\n'
+                  '        tool_id = current_tool(context)\n'
+                  '        info = {\n'
+                  '            "shape": str(TOOL_TO_SHAPE.get(tool_id, "BOX")),\n'
+                  '            "tool_id": tool_id,\n'
+                  '            "session_active": True,\n'
+                  '            "passthrough": False,\n'
+                  '        }\n'
+                  '    _trace(\n'
+                  '        "ctrl_mask_session_ensured_from_pointer",\n'
+                  '        active=bool(info.get("session_active")),\n'
+                  '        tool=str(info.get("tool_id") or ""),\n'
+                  '    )\n'
+                  '    return dict(info or {})\n'
+                  '\n'
+                  '\n'
+              )
+              if anchor not in t:
+                  raise SystemExit('gesture_begin anchor missing')
+              t = t.replace(anchor, helper + anchor, 1)
+          compile(t, str(tool), 'exec')
+          tool.write_text(t, encoding='utf-8', newline='\n')
+
+          gesture = work/'runtime/sculpt_mask_gesture.py'
+          g = gesture.read_text(encoding='utf-8').replace('\r\n','\n')
+
+          # Robust tap-only classifier. Drag routing never depends on this ray-cast.
+          if 'def _tap_hits_active_surface(' not in g:
+              anchor = 'def _drag_hits_active_surface(context, event) -> bool:\n'
+              helper = (
+                  'def _tap_hits_active_surface(context, event) -> bool:\n'
+                  '    """Tap-only surface test with a tiny pixel tolerance around the pen tip."""\n'
+                  '    x, y = _region_xy(event)\n'
+                  '    for dx, dy in ((0, 0), (2, 0), (-2, 0), (0, 2), (0, -2),\n'
+                  '                   (2, 2), (-2, 2), (2, -2), (-2, -2)):\n'
+                  '        if _surface_hit_xy(context, x + dx, y + dy):\n'
+                  '            return True\n'
+                  '    return False\n'
+                  '\n'
+                  '\n'
+              )
+              if anchor not in g:
+                  raise SystemExit('drag surface helper anchor missing')
+              g = g.replace(anchor, helper + anchor, 1)
+
+          # The operator no longer classifies drag ownership at PRESS time.
+          # background_only is kept for wire compatibility but ordinary V23 calls
+          # use the full intent path.
+          cls = g.index('class LUMAFOLD_OT_sculpt_mask_gesture_v2')
+          invoke = g.index('    def invoke(self, context, event):', cls)
+          modal = g.index('\n    def modal(self, context, event):', invoke)
+          invoke_block = g[invoke:modal]
+          old_start = (
+              '        self._start_on_surface = (\n'
+              '            False\n'
+              '            if bool(self.background_only)\n'
+              '            else bool(_drag_hits_active_surface(context, event))\n'
+              '        )\n'
+          )
+          new_start = (
+              '        # Drag ownership is resolved lazily by Blender itself once the\n'
+              '        # pointer crosses the drag threshold. Tap ownership is checked\n'
+              '        # read-only at release.\n'
+              '        self._start_on_surface = None\n'
+          )
+          if old_start in invoke_block:
+              invoke_block = invoke_block.replace(old_start, new_start, 1)
+          elif 'self._start_on_surface = None' not in invoke_block:
+              raise SystemExit('V22 invoke surface state not found')
+          g = g[:invoke] + invoke_block + g[modal:]
+
+          # Replace modal with one-owner intent split. Once a native modal is
+          # started, LumaFold finishes immediately.
+          modal = g.index('    def modal(self, context, event):', cls)
+          modal_end = g.index('\n\ndef handle_pointer_press', modal)
+          new_modal = (
+              '    def modal(self, context, event):\n'
+              '        event_type = str(getattr(event, "type", "") or "").upper()\n'
+              '        event_value = str(getattr(event, "value", "") or "").upper()\n'
+              '\n'
+              '        if event_type in {"LEFT_CTRL", "RIGHT_CTRL"} and event_value == "RELEASE":\n'
+              '            _bridge_observe_event(context, event)\n'
+              '            return {"CANCELLED"}\n'
+              '        if event_type == "WINDOW_DEACTIVATE":\n'
+              '            _bridge_observe_event(context, event)\n'
+              '            return {"CANCELLED"}\n'
+              '        if event_type == "ESC":\n'
+              '            return {"CANCELLED"}\n'
+              '\n'
+              '        if event_type in _MOVE_EVENTS:\n'
+              '            x, y = _region_xy(event)\n'
+              '            dx = x - self._start_x\n'
+              '            dy = y - self._start_y\n'
+              '            if not self._dragging and dx * dx + dy * dy >= self._threshold_sq:\n'
+              '                self._dragging = True\n'
+              '\n'
+              '                begin = getattr(_TOOL_BRIDGE, "surface_brush_handoff_begin", None) if _TOOL_BRIDGE is not None else None\n'
+              '                end = getattr(_TOOL_BRIDGE, "surface_brush_handoff_end", None) if _TOOL_BRIDGE is not None else None\n'
+              '                sculpt_result = {"CANCELLED"}\n'
+              '                if callable(begin) and bool(begin(context)):\n'
+              '                    try:\n'
+              '                        sculpt_result = _native_mask_stroke(context, bool(self._sharpen))\n'
+              '                    finally:\n'
+              '                        if callable(end):\n'
+              '                            end(context)\n'
+              '\n'
+              '                if "RUNNING_MODAL" in sculpt_result or "FINISHED" in sculpt_result:\n'
+              '                    _trace(\n'
+              '                        "surface_mask_drag_handoff", context, event,\n'
+              '                        result=sorted(sculpt_result),\n'
+              '                    )\n'
+              '                    return {"FINISHED"}\n'
+              '\n'
+              '                if "PASS_THROUGH" in sculpt_result:\n'
+              '                    result = _invoke_native_background_gesture(\n'
+              '                        context, self._tool_id, erase=bool(self._sharpen),\n'
+              '                    )\n'
+              '                    _trace(\n'
+              '                        "background_native_mask_handoff", context, event,\n'
+              '                        tool=self._tool_id, result=sorted(result),\n'
+              '                    )\n'
+              '                    return {"FINISHED"}\n'
+              '\n'
+              '                _trace(\n'
+              '                    "mask_drag_handoff_failed_closed", context, event,\n'
+              '                    result=sorted(sculpt_result),\n'
+              '                )\n'
+              '                return {"FINISHED"}\n'
+              '            return {"RUNNING_MODAL"}\n'
+              '\n'
+              '        if event_type == "LEFTMOUSE" and event_value == "RELEASE":\n'
+              '            if self._dragging:\n'
+              '                return {"FINISHED"}\n'
+              '            on_surface = False if bool(self.background_only) else _tap_hits_active_surface(context, event)\n'
+              '            if on_surface:\n'
+              '                result = _run_mask_filter(context, bool(self._sharpen))\n'
+              '                reason = "mask_sharpen_tap" if self._sharpen else "mask_feather_tap"\n'
+              '            elif not self._sharpen:\n'
+              '                result = _run_mask_flood(context, "INVERT")\n'
+              '                reason = "background_invert_tap"\n'
+              '            else:\n'
+              '                result = {"CANCELLED"}\n'
+              '                reason = "background_alt_tap_noop"\n'
+              '            _trace(\n'
+              '                reason, context, event, result=sorted(result),\n'
+              '                tool=_bridge_current_tool(context),\n'
+              '            )\n'
+              '            return {"FINISHED"}\n'
+              '\n'
+              '        return {"RUNNING_MODAL", "PASS_THROUGH"}\n'
+          )
+          g = g[:modal] + new_modal + g[modal_end:]
+
+          # Every Ctrl+LMB press now starts the intent owner immediately. It consumes
+          # the original PRESS, so Blender's default Ctrl=inverted sculpt cannot race it.
+          hp_start = g.index('def handle_pointer_press(context, event, target):')
+          hp_end = g.index('\ndef install(', hp_start)
+          new_handle = (
+              'def handle_pointer_press(context, event, target):\n'
+              '    if str(getattr(event, "type", "") or "").upper() != "LEFTMOUSE":\n'
+              '        return None\n'
+              '    if str(getattr(event, "value", "") or "").upper() != "PRESS":\n'
+              '        return None\n'
+              '    if not bool(getattr(event, "ctrl", False)) or bool(getattr(event, "shift", False)):\n'
+              '        return None\n'
+              '    if target is None:\n'
+              '        return True\n'
+              '\n'
+              '    window, area, region = target\n'
+              '    try:\n'
+              '        with bpy.context.temp_override(window=window, area=area, region=region):\n'
+              '            routed_context = bpy.context\n'
+              '            ensure = getattr(_TOOL_BRIDGE, "ctrl_session_ensure", None) if _TOOL_BRIDGE is not None else None\n'
+              '            if callable(ensure):\n'
+              '                ensure(routed_context)\n'
+              '            result = set(\n'
+              '                bpy.ops.lumafold.sculpt_mask_gesture_v2(\n'
+              '                    "INVOKE_DEFAULT", background_only=False,\n'
+              '                )\n'
+              '                or ()\n'
+              '            )\n'
+              '            ok = "RUNNING_MODAL" in result\n'
+              '            _trace(\n'
+              '                "mask_intent_started" if ok else "mask_intent_failed_closed",\n'
+              '                routed_context, event, result=sorted(result),\n'
+              '            )\n'
+              '            return True\n'
+              '    except (RuntimeError, TypeError, AttributeError) as exc:\n'
+              '        _trace(\n'
+              '            "ctrl_mask_intent_exception_closed", context, event,\n'
+              '            error=f"{type(exc).__name__}: {exc}",\n'
+              '        )\n'
+              '        return True\n'
+              '\n'
+              '\n'
+          )
+          g = g[:hp_start] + new_handle + g[hp_end:]
+          compile(g, str(gesture), 'exec')
+          gesture.write_text(g, encoding='utf-8', newline='\n')
+
+          # ==============================================================
+          # 2) Satellite click-through guard.
+          #
+          # Satellite is intentionally WS_EX_NOACTIVATE, so Blender stays the
+          # keyboard foreground owner. If Windows/tablet delivery also gives
+          # Blender a pointer edge while the cursor is physically over the
+          # Satellite child process, the Blender universal broker must swallow
+          # it. WindowFromPoint + child PID is authoritative and covers both
+          # the main Satellite and Secondary Surface windows.
+          # ==============================================================
+          route = work/'runtime/sculpt_route_truth.py'
+          r = route.read_text(encoding='utf-8').replace('\r\n','\n')
+
+          if 'import ctypes\n' not in r:
+              r = r.replace('from __future__ import annotations\n', 'from __future__ import annotations\n\nimport ctypes\nfrom ctypes import wintypes\n', 1)
+
+          if '_SATELLITE_BRIDGE = None' not in r:
+              anchor = '_MASK_TOOL_BRIDGE = None\n'
+              if anchor not in r:
+                  raise SystemExit('route global anchor missing')
+              r = r.replace(anchor, anchor + '_SATELLITE_BRIDGE = None\n', 1)
+
+          if 'def _pointer_over_satellite_process() -> bool:' not in r:
+              anchor = 'def _route_event_context_authority(context, event, *, host=None) -> bool:\n'
+              helper = (
+                  'def _pointer_over_satellite_process() -> bool:\n'
+                  '    bridge = _SATELLITE_BRIDGE\n'
+                  '    base = _BASE\n'
+                  '    if bridge is None or base is None:\n'
+                  '        return False\n'
+                  '    try:\n'
+                  '        if str(base._host_mode() or "") != "satellite":\n'
+                  '            return False\n'
+                  '        proc = getattr(bridge, "satellite_process", None)\n'
+                  '        pid = int(getattr(proc, "pid", 0) or 0)\n'
+                  '        if pid <= 0 or proc.poll() is not None:\n'
+                  '            return False\n'
+                  '\n'
+                  '        class POINT(ctypes.Structure):\n'
+                  '            _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]\n'
+                  '\n'
+                  '        user32 = ctypes.WinDLL("user32", use_last_error=True)\n'
+                  '        user32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]\n'
+                  '        user32.GetCursorPos.restype = wintypes.BOOL\n'
+                  '        user32.WindowFromPoint.argtypes = [POINT]\n'
+                  '        user32.WindowFromPoint.restype = wintypes.HWND\n'
+                  '        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]\n'
+                  '        user32.GetWindowThreadProcessId.restype = wintypes.DWORD\n'
+                  '\n'
+                  '        pt = POINT()\n'
+                  '        if not user32.GetCursorPos(ctypes.byref(pt)):\n'
+                  '            return False\n'
+                  '        hwnd = user32.WindowFromPoint(pt)\n'
+                  '        if not hwnd:\n'
+                  '            return False\n'
+                  '        owner_pid = wintypes.DWORD(0)\n'
+                  '        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner_pid))\n'
+                  '        return int(owner_pid.value) == pid\n'
+                  '    except Exception:\n'
+                  '        return False\n'
+                  '\n'
+                  '\n'
+              )
+              if anchor not in r:
+                  raise SystemExit('route function anchor missing')
+              r = r.replace(anchor, helper + anchor, 1)
+
+          route_start = r.index('def _route_event_context_authority(context, event, *, host=None) -> bool:')
+          route_end = r.index('\n\ndef install(', route_start)
+          route_block = r[route_start:route_end]
+          guard = (
+              '    if event_type in {\n'
+              '        "LEFTMOUSE", "RIGHTMOUSE", "MIDDLEMOUSE",\n'
+              '        "WHEELUPMOUSE", "WHEELDOWNMOUSE",\n'
+              '    } and _pointer_over_satellite_process():\n'
+              '        _trace("satellite_pointer_guard", context, event)\n'
+              '        return True\n'
+              '\n'
+          )
+          if 'satellite_pointer_guard' not in route_block:
+              marker = '    if event_type == "WINDOW_DEACTIVATE":\n'
+              if marker not in route_block:
+                  raise SystemExit('route early guard marker missing')
+              route_block = route_block.replace(marker, guard + marker, 1)
+              r = r[:route_start] + route_block + r[route_end:]
+
+          # Add bridge dependency to install/uninstall.
+          install_start = r.index('def install(\n')
+          install_end = r.index('\n\ndef uninstall()', install_start)
+          install_block = r[install_start:install_end]
+          if 'satellite_bridge=None,' not in install_block:
+              install_block = install_block.replace(
+                  '    mask_tool_bridge=None,\n):',
+                  '    mask_tool_bridge=None,\n    satellite_bridge=None,\n):',
+                  1,
+              )
+              install_block = install_block.replace(
+                  'global _INSTALLED, _BASE, _TRACE, _NATIVE_POINTER, _ALT_GESTURE, _MASK_GESTURE, _VISIBILITY_ROUTE, _VISIBILITY_TOOL_BRIDGE, _MASK_TOOL_BRIDGE',
+                  'global _INSTALLED, _BASE, _TRACE, _NATIVE_POINTER, _ALT_GESTURE, _MASK_GESTURE, _VISIBILITY_ROUTE, _VISIBILITY_TOOL_BRIDGE, _MASK_TOOL_BRIDGE, _SATELLITE_BRIDGE',
+                  1,
+              )
+              assign = '    _MASK_TOOL_BRIDGE = mask_tool_bridge\n'
+              if assign not in install_block:
+                  raise SystemExit('route install assignment anchor missing')
+              install_block = install_block.replace(assign, assign + '    _SATELLITE_BRIDGE = satellite_bridge\n', 1)
+              r = r[:install_start] + install_block + r[install_end:]
+
+          uninstall_start = r.index('def uninstall():')
+          uninstall_block = r[uninstall_start:]
+          if '_SATELLITE_BRIDGE' not in uninstall_block.split('\n', 3)[1]:
+              uninstall_block = uninstall_block.replace(
+                  'global _INSTALLED, _BASE, _TRACE, _NATIVE_POINTER, _ALT_GESTURE, _MASK_GESTURE, _VISIBILITY_ROUTE, _VISIBILITY_TOOL_BRIDGE, _MASK_TOOL_BRIDGE, _UNDO_SESSION_WORKER_RUNNING',
+                  'global _INSTALLED, _BASE, _TRACE, _NATIVE_POINTER, _ALT_GESTURE, _MASK_GESTURE, _VISIBILITY_ROUTE, _VISIBILITY_TOOL_BRIDGE, _MASK_TOOL_BRIDGE, _SATELLITE_BRIDGE, _UNDO_SESSION_WORKER_RUNNING',
+                  1,
+              )
+          if '    _SATELLITE_BRIDGE = None\n' not in uninstall_block:
+              marker = '    _MASK_TOOL_BRIDGE = None\n'
+              if marker not in uninstall_block:
+                  raise SystemExit('route uninstall anchor missing')
+              uninstall_block = uninstall_block.replace(marker, marker + '    _SATELLITE_BRIDGE = None\n', 1)
+          r = r[:uninstall_start] + uninstall_block
+          compile(r, str(route), 'exec')
+          route.write_text(r, encoding='utf-8', newline='\n')
+
+          init = work/'__init__.py'
+          i = init.read_text(encoding='utf-8').replace('\r\n','\n')
+          call_start = i.index('    sculpt_route_truth.install(\n')
+          call_end = i.index('    )\n', call_start) + len('    )\n')
+          call = i[call_start:call_end]
+          if 'operators.BRIDGE' not in call:
+              call = call.replace(
+                  '        sculpt_mask_tool_bridge,\n',
+                  '        sculpt_mask_tool_bridge,\n        operators.BRIDGE,\n',
+                  1,
+              )
+              i = i[:call_start] + call + i[call_end:]
+          compile(i, str(init), 'exec')
+          init.write_text(i, encoding='utf-8', newline='\n')
+
+          # Prime ImGui focus on every client-button down, not only when Windows
+          # happens to emit WM_MOUSEACTIVATE. This is non-activating and does not
+          # move keyboard focus away from Blender.
+          sat = work/'desktop/satellite_host.py'
+          s = sat.read_text(encoding='utf-8').replace('\r\n','\n')
+          wnd = s.index('def _wndproc_with_shortcut_capture')
+          wnd_end = s.index('\ndef _button_state', wnd)
+          wb = s[wnd:wnd_end]
+          if 'satellite_client_pointer_reprime' not in wb:
+              marker = '    if int(msg) == int(_runtime.WM_APP_SHOW):\n'
+              block = (
+                  '    if int(msg) in (\n'
+                  '        int(_runtime.WM_LBUTTONDOWN),\n'
+                  '        int(_runtime.WM_RBUTTONDOWN),\n'
+                  '        int(_runtime.WM_MBUTTONDOWN),\n'
+                  '    ) and not _interactions.shortcut_capture_active():\n'
+                  '        _prime_pointer_focus()\n'
+                  '        # satellite_client_pointer_reprime\n'
+                  '\n'
+              )
+              if marker not in wb:
+                  raise SystemExit('Satellite wndproc pointer reprime anchor missing')
+              wb = wb.replace(marker, block + marker, 1)
+              s = s[:wnd] + wb + s[wnd_end:]
+          compile(s, str(sat), 'exec')
+          sat.write_text(s, encoding='utf-8', newline='\n')
+
+          # ==============================================================
+          # Regression gates
+          # ==============================================================
+          assert 'mask_feather_tap' in g
+          assert 'mask_sharpen_tap' in g
+          assert '_run_mask_filter(context, bool(self._sharpen))' in g
+          assert 'background_invert_tap' in g
+          assert 'surface_mask_drag_handoff' in g
+          assert 'background_native_mask_handoff' in g
+          assert 'ctrl_session_ensure' in t
+          assert 'satellite_pointer_guard' in r
+          assert 'WindowFromPoint' in r
+          assert 'operators.BRIDGE' in i
+          assert 'satellite_client_pointer_reprime' in s
+
+          # Preserve V22/V17 accepted fixes.
+          sat_rt = (work/'desktop/satellite_host_runtime.py').read_text(encoding='utf-8')
+          secondary = (work/'desktop/secondary_surface_host.py').read_text(encoding='utf-8')
+          bridge = (work/'desktop/bridge_server.py').read_text(encoding='utf-8')
+          assert '_restore_blender_foreground_if_satellite_activated()' in s
+          assert '_mirror_quick_shortcut_selection()' in s
+          assert 'host_switch_hit_test(x, y)' in s
+          assert 'if key == "brush_preview_cache":' in sat_rt
+          assert 'sculpt.brush.library_replace_slot' in secondary
+          assert 'def _sculpt_visual_state(self):' in bridge
+
+          for f in work.rglob('*.py'):
+              compile(f.read_text(encoding='utf-8'), str(f), 'exec')
+
+          out.unlink(missing_ok=True)
+          with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+              for f in sorted(work.rglob('*')):
+                  if f.is_file():
+                      z.write(f, f.relative_to(work).as_posix())
+
+          digest = hashlib.sha256(out.read_bytes()).hexdigest()
+          out.with_suffix(out.suffix+'.sha256.txt').write_text(
+              f'{digest}  {out.name}\n', encoding='utf-8'
+          )
+          print('SHA256', digest)
+          '@ | Set-Content $py -Encoding UTF8
+          python $py
+
+      - name: Blender 5.2.0 and 5.2.2 extension validation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pkg = (Resolve-Path "$PWD/manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v23-mask-tap-satellite-hitguard.zip").Path
+          foreach ($v in @('5.2.0','5.2.2')) {
+            $z = Join-Path $env:RUNNER_TEMP "blender-$v.zip"
+            $d = Join-Path $env:RUNNER_TEMP "blender-$v"
+            curl.exe -L --fail --retry 3 "https://download.blender.org/release/Blender5.2/blender-$v-windows-x64.zip" -o $z
+            if ($LASTEXITCODE -ne 0) { throw "Blender $v download failed" }
+            Expand-Archive $z $d -Force
+            $exe = Get-ChildItem $d -Filter blender.exe -Recurse | Select-Object -First 1
+            if (-not $exe) { throw "Blender $v executable missing" }
+            & $exe.FullName --command extension validate $pkg
+            if ($LASTEXITCODE -ne 0) { throw "Blender $v validation failed" }
+          }
+
+      - name: Publish
+        shell: pwsh
+        run: |
+          git config user.name 'LumaFold Build Bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v23-mask-tap-satellite-hitguard.zip*
+          git commit -m "candidate: restore Mask feather/sharpen taps and block Satellite click-through"
+          git push origin HEAD:main
