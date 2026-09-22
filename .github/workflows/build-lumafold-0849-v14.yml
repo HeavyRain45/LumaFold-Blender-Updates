@@ -139,32 +139,32 @@ jobs:
 
           wnd = h.index('def _wndproc_with_shortcut_capture')
           first_if = h.index('    if ', wnd)
-          native = '''    if int(msg) == int(_runtime.WM_LBUTTONDOWN) and not _interactions.shortcut_capture_active():
-              try:
-                  x, y = _runtime._xy(lparam)
-              except Exception:
-                  x, y = -1, -1
-              if _interactions.host_switch_hit_test(x, y):
-                  # Native press-edge commit: no ImGui release/focus dependency.
-                  _runtime.user32.PostMessageW(hwnd, _runtime.WM_CLOSE, 0, 0)
-                  return 0
-
-              # Otherwise preserve normal ImGui input handling.
-          
-          '''
+          native = (
+              '    if int(msg) == int(_runtime.WM_LBUTTONDOWN) and not _interactions.shortcut_capture_active():\n'
+              '        try:\n'
+              '            x, y = _runtime._xy(lparam)\n'
+              '        except Exception:\n'
+              '            x, y = -1, -1\n'
+              '        if _interactions.host_switch_hit_test(x, y):\n'
+              '            # Native press-edge commit: no ImGui release/focus dependency.\n'
+              '            _runtime.user32.PostMessageW(hwnd, _runtime.WM_CLOSE, 0, 0)\n'
+              '            return 0\n'
+              '\n'
+          )
           if 'host_switch_hit_test(x, y)' not in h[wnd:h.index('def _button_state', wnd)]:
               h = h[:first_if] + native + h[first_if:]
 
           # Lightweight visual refresh from Secondary Surface after a targeted
           # Brush Library replacement finishes.
-          sync_if = '''    if int(msg) == WM_APP_PRIMARY_BRUSH_VISUAL_SYNC:
-              try:
-                  _runtime.actions.put({"action": "get_sculpt_visual_state"})
-              except Exception:
-                  pass
-              return 0
-
-          '''
+          sync_if = (
+              '    if int(msg) == WM_APP_PRIMARY_BRUSH_VISUAL_SYNC:\n'
+              '        try:\n'
+              '            _runtime.actions.put({"action": "get_sculpt_visual_state"})\n'
+              '        except Exception:\n'
+              '            pass\n'
+              '        return 0\n'
+              '\n'
+          )
           if 'if int(msg) == WM_APP_PRIMARY_BRUSH_VISUAL_SYNC:' not in h[wnd:h.index('def _button_state', wnd)]:
               insert = h.index('    if int(msg) == int(_runtime.WM_APP_SHOW):', wnd)
               h = h[:insert] + sync_if + h[insert:]
