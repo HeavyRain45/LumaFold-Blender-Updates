@@ -1,0 +1,170 @@
+name: Build LumaFold 0.8.49 V26 Quick Brush Click
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build-lumafold-0849-v26-quickbrush-click.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch V25 Quick Brush interaction
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $py = Join-Path $env:RUNNER_TEMP 'v26.py'
+          @'
+          import pathlib, zipfile, shutil, hashlib, os
+
+          root = pathlib.Path.cwd()
+          src = root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v25-secondary-preview-stable.zip'
+          out = root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v26-quickbrush-click.zip'
+          work = pathlib.Path(os.environ['RUNNER_TEMP'])/'lf_v26'
+          shutil.rmtree(work, ignore_errors=True)
+          work.mkdir(parents=True)
+          with zipfile.ZipFile(src) as z:
+              z.extractall(work)
+
+          # --------------------------------------------------------------
+          # 1) Remove Quick Brush hover annotations from both Embedded/Satellite.
+          #    Quick Brush tiles should be self-explanatory and visually quiet.
+          # --------------------------------------------------------------
+          view = work/'ui/sculpt_view.py'
+          v = view.read_text(encoding='utf-8').replace('\r\n','\n')
+
+          tooltip_block = '''    try:
+              if imgui.is_item_hovered():
+                  if empty:
+                      tip = "添加当前快捷笔刷"
+                  else:
+                      tip = str(label or "快捷笔刷")
+                      if shortcut:
+                          tip += " · " + shortcut
+                      tip += "\n图标：打开笔刷库替换槽位 · 名称：切换笔刷 · 右键：槽位菜单"
+                  imgui.set_tooltip(tip)
+          except Exception:
+              pass
+          '''
+          if tooltip_block in v:
+              v = v.replace(tooltip_block, '', 1)
+          elif '图标：打开笔刷库替换槽位' in v:
+              raise SystemExit('Quick Brush visual tooltip block shape changed')
+
+          # --------------------------------------------------------------
+          # 2) Preview/icon click = switch to that Quick Brush AND open library.
+          #    Returning True lets the frozen foundation perform the normal
+          #    quick_slot selection transaction in the same frame.
+          # --------------------------------------------------------------
+          old = '''        if clicked_preview:
+              _open_targeted_library(int(ident), _foundation._item_anchor(imgui_arg, scale_arg))
+              return False
+          '''
+          new = '''        if clicked_preview:
+              _open_targeted_library(int(ident), _foundation._item_anchor(imgui_arg, scale_arg))
+              # Keep the normal Quick Brush selection path alive as well:
+              # icon click selects this slot and opens its replacement library.
+              return True
+          '''
+          if old not in v:
+              raise SystemExit('Quick Brush preview-click branch missing')
+          v = v.replace(old, new, 1)
+
+          compile(v, str(view), 'exec')
+          view.write_text(v, encoding='utf-8', newline='\n')
+
+          # Also remove the frozen fallback tooltip so no early/fallback host path
+          # can resurrect a Quick Brush hover window.
+          foundation = work/'ui/sculpt_view_foundation.py'
+          f = foundation.read_text(encoding='utf-8').replace('\r\n','\n')
+          fn_start = f.index('def _quick_slot_widget(')
+          fn_end = f.index('\n\ndef _current_asset_identity', fn_start)
+          fb = f[fn_start:fn_end]
+          fb = fb.replace('    tooltip = "添加当前快捷笔刷" if empty else str(label or "快捷笔刷")\n', '')
+          fb = fb.replace(', selected=selected, tooltip=tooltip,', ', selected=selected,')
+          fb = fb.replace(
+              '        if imgui.is_item_hovered():\n'
+              '            imgui.set_tooltip(tooltip)\n',
+              ''
+          )
+          f = f[:fn_start] + fb + f[fn_end:]
+          compile(f, str(foundation), 'exec')
+          foundation.write_text(f, encoding='utf-8', newline='\n')
+
+          # --------------------------------------------------------------
+          # Regression gates
+          # --------------------------------------------------------------
+          assert '图标：打开笔刷库替换槽位' not in v
+          assert 'return True' in v[v.index('if clicked_preview:'):v.index('def _button_product', v.index('if clicked_preview:'))]
+          assert 'tooltip = "添加当前快捷笔刷"' not in fb
+          assert 'imgui.set_tooltip(tooltip)' not in fb
+
+          # Preserve V25 preview reliability and prior accepted behavior.
+          secondary = (work/'desktop/secondary_surface_host.py').read_text(encoding='utf-8')
+          mask = (work/'runtime/sculpt_mask_gesture.py').read_text(encoding='utf-8')
+          route = (work/'runtime/sculpt_route_truth.py').read_text(encoding='utf-8')
+          sat = (work/'desktop/satellite_host.py').read_text(encoding='utf-8')
+          sat_rt = (work/'desktop/satellite_host_runtime.py').read_text(encoding='utf-8')
+
+          assert 'on_request_preview=_request_brush_previews_exact' in secondary
+          assert '_BRUSH_PREVIEW_QUEUE_LIMIT = 4' in secondary
+          assert 'clean_age >= 0.18' in secondary
+          assert '_CLASSES = (LUMAFOLD_OT_sculpt_mask_gesture_v2,)' in mask
+          assert 'mask_feather_tap' in mask
+          assert 'mask_sharpen_tap' in mask
+          assert 'background_invert_tap' in mask
+          assert 'satellite_pointer_guard' in route
+          assert 'satellite_client_pointer_reprime' in sat
+          assert '_restore_blender_foreground_if_satellite_activated()' in sat
+          assert '_mirror_quick_shortcut_selection()' in sat
+          assert 'host_switch_hit_test(x, y)' in sat
+          assert 'if key == "brush_preview_cache":' in sat_rt
+
+          for py in work.rglob('*.py'):
+              compile(py.read_text(encoding='utf-8'), str(py), 'exec')
+
+          out.unlink(missing_ok=True)
+          with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+              for file in sorted(work.rglob('*')):
+                  if file.is_file():
+                      z.write(file, file.relative_to(work).as_posix())
+
+          digest = hashlib.sha256(out.read_bytes()).hexdigest()
+          out.with_suffix(out.suffix+'.sha256.txt').write_text(
+              f'{digest}  {out.name}\n', encoding='utf-8'
+          )
+          print('SHA256', digest)
+          '@ | Set-Content $py -Encoding UTF8
+          python $py
+
+      - name: Blender 5.2.0 and 5.2.2 extension validation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pkg = (Resolve-Path "$PWD/manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v26-quickbrush-click.zip").Path
+          foreach ($v in @('5.2.0','5.2.2')) {
+            $z = Join-Path $env:RUNNER_TEMP "blender-$v.zip"
+            $d = Join-Path $env:RUNNER_TEMP "blender-$v"
+            curl.exe -L --fail --retry 3 "https://download.blender.org/release/Blender5.2/blender-$v-windows-x64.zip" -o $z
+            if ($LASTEXITCODE -ne 0) { throw "Blender $v download failed" }
+            Expand-Archive $z $d -Force
+            $exe = Get-ChildItem $d -Filter blender.exe -Recurse | Select-Object -First 1
+            if (-not $exe) { throw "Blender $v executable missing" }
+            & $exe.FullName --command extension validate $pkg
+            if ($LASTEXITCODE -ne 0) { throw "Blender $v validation failed" }
+          }
+
+      - name: Publish
+        shell: pwsh
+        run: |
+          git config user.name 'LumaFold Build Bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v26-quickbrush-click.zip*
+          git commit -m "candidate: simplify Quick Brush hover and select-on-library-open"
+          git push origin HEAD:main
