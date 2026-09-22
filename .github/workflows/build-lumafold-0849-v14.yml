@@ -220,18 +220,19 @@ jobs:
 
           if 'def _activate_brush_library_product(' not in s:
               anchor = 'def _queue_state(fields):\n    actions.put({"action": "set_module_state", "namespace": "sculpt", "fields": dict(fields)})\n\n'
-              helper = '''def _activate_brush_library_product(identity):
-              global quick_replace_slot
-              identity = str(identity or "")
-              slot = int(quick_replace_slot)
-              if slot >= 0:
-                  # Match Embedded targeted replacement semantics.
-                  _queue_command("sculpt.brush.library_assign_slot", identity=identity, slot=slot)
-                  quick_replace_slot = -1
-              _queue_command("sculpt.brush.library_activate", identity=identity)
-
-
-          '''
+              helper = (
+                  'def _activate_brush_library_product(identity):\n'
+                  '    global quick_replace_slot\n'
+                  '    identity = str(identity or "")\n'
+                  '    slot = int(quick_replace_slot)\n'
+                  '    if slot >= 0:\n'
+                  '        # Match Embedded targeted replacement semantics.\n'
+                  '        _queue_command("sculpt.brush.library_assign_slot", identity=identity, slot=slot)\n'
+                  '        quick_replace_slot = -1\n'
+                  '    _queue_command("sculpt.brush.library_activate", identity=identity)\n'
+                  '\n'
+                  '\n'
+              )
               if anchor not in s:
                   raise SystemExit('secondary helper insertion anchor missing')
               s = s.replace(anchor, anchor + '\n' + helper, 1)
@@ -242,11 +243,12 @@ jobs:
           wblock = s[wstart:wend]
           if 'if msg == WM_APP_QUICK_REPLACE_SLOT:' not in wblock:
               needle = '    if msg == WM_APP_SECONDARY_KIND:\n'
-              handler = '''    if msg == WM_APP_QUICK_REPLACE_SLOT:
-              global quick_replace_slot
-              quick_replace_slot = int(wparam) - 1
-              return 0
-          '''
+              handler = (
+                  '    if msg == WM_APP_QUICK_REPLACE_SLOT:\n'
+                  '        global quick_replace_slot\n'
+                  '        quick_replace_slot = int(wparam) - 1\n'
+                  '        return 0\n'
+              )
               if needle not in wblock:
                   raise SystemExit('secondary wndproc app-message anchor missing')
               wblock = wblock.replace(needle, handler + needle, 1)
@@ -269,42 +271,43 @@ jobs:
           b = bridge.read_text(encoding='utf-8').replace('\r\n','\n')
           if 'if action == "get_sculpt_visual_state":' not in b:
               anchor = '        if action == "set_state":\n'
-              visual = '''        if action == "get_sculpt_visual_state":
-              sculpt_state = APP.store.namespace("sculpt")
-              visual_keys = (
-                  "quick_slot", "quick_brush_slots", "active_quick_slot",
-                  "current_brush_name", "current_brush_asset", "current_brush_type",
-                  "current_brush_preview", "brush_preview_cache",
-                  "brush_sync_status", "brush_action_status",
+              visual = (
+                  '        if action == "get_sculpt_visual_state":\n'
+                  '            sculpt_state = APP.store.namespace("sculpt")\n'
+                  '            visual_keys = (\n'
+                  '                "quick_slot", "quick_brush_slots", "active_quick_slot",\n'
+                  '                "current_brush_name", "current_brush_asset", "current_brush_type",\n'
+                  '                "current_brush_preview", "brush_preview_cache",\n'
+                  '                "brush_sync_status", "brush_action_status",\n'
+                  '            )\n'
+                  '            visual_state = {\n'
+                  '                key: sculpt_state.get(key)\n'
+                  '                for key in visual_keys\n'
+                  '                if key in sculpt_state\n'
+                  '            }\n'
+                  '            status = APP.modules.status("sculpt")\n'
+                  '            context = APP.state.context\n'
+                  '            return {\n'
+                  '                "ok": True,\n'
+                  '                "state": {\n'
+                  '                    "module_state": {"sculpt": visual_state},\n'
+                  '                    "sculpt_status": {\n'
+                  '                        "active": bool(status.active),\n'
+                  '                        "enabled": bool(status.enabled),\n'
+                  '                        "reason": str(status.reason or ""),\n'
+                  '                        "mode": str(context.mode or ""),\n'
+                  '                        "workspace": "",\n'
+                  '                    },\n'
+                  '                    "host_control": {\n'
+                  '                        **HOST_CONTROL.snapshot(),\n'
+                  '                        "satellite_ready": bool(self.satellite_ready),\n'
+                  '                        "satellite_active": bool(self.satellite_active),\n'
+                  '                        "satellite_closing": bool(self.satellite_closing),\n'
+                  '                        "satellite_rect": dict(self.satellite_rect) if isinstance(self.satellite_rect, dict) else None,\n'
+                  '                    },\n'
+                  '                },\n'
+                  '            }\n'
               )
-              visual_state = {
-                  key: sculpt_state.get(key)
-                  for key in visual_keys
-                  if key in sculpt_state
-              }
-              status = APP.modules.status("sculpt")
-              context = APP.state.context
-              return {
-                  "ok": True,
-                  "state": {
-                      "module_state": {"sculpt": visual_state},
-                      "sculpt_status": {
-                          "active": bool(status.active),
-                          "enabled": bool(status.enabled),
-                          "reason": str(status.reason or ""),
-                          "mode": str(context.mode or ""),
-                          "workspace": "",
-                      },
-                      "host_control": {
-                          **HOST_CONTROL.snapshot(),
-                          "satellite_ready": bool(self.satellite_ready),
-                          "satellite_active": bool(self.satellite_active),
-                          "satellite_closing": bool(self.satellite_closing),
-                          "satellite_rect": dict(self.satellite_rect) if isinstance(self.satellite_rect, dict) else None,
-                      },
-                  },
-              }
-          '''
               if anchor not in b:
                   raise SystemExit('bridge visual-state insertion anchor missing')
               b = b.replace(anchor, visual + anchor, 1)
