@@ -136,7 +136,7 @@ jobs:
           assert 'LEFT_SHIFT' in n and 'RIGHT_SHIFT' in n
           assert '_native_rotate_alive' in n
           assert 'bpy.ops.view3d.rotate("INVOKE_DEFAULT")' in n
-          assert 'invoke_blender_rotate(target)' in p
+          assert 'getattr(navigation, "invoke_blender_rotate", None)' in p
           assert 'bpy.ops.view3d.rotate("INVOKE_DEFAULT")' not in p
 
           # Plain pen/LMB background route still uses Blender as hit-test truth.
