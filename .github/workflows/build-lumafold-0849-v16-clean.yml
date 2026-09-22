@@ -84,7 +84,7 @@ jobs:
           b = bridge.read_text(encoding='utf-8').replace('\r\n','\n')
 
           if 'def _sculpt_visual_state(self):' not in b:
-              anchor = '    def _process(self, payload):\n'
+              anchor = '    def _process(self, payload: Dict[str, Any]) -> Dict[str, Any]:\n'
               helper = (
                   '    def _sculpt_visual_state(self):\n'
                   '        sculpt_state = APP.store.namespace("sculpt")\n'
@@ -133,21 +133,30 @@ jobs:
               b = b.replace(anchor, block + anchor, 1)
 
           # Targeted replacement is the one Secondary command whose response
-          # should be light and state-bearing. This also prevents the Secondary
-          # transport adapter from performing a full get_state immediately after.
+          # must be light and state-bearing. Avoid the normal Secondary full snapshot.
           command_start = b.index('        if action == "command":')
           command_return = b.index('            return response', command_start)
           command_block = b[command_start:command_return]
-          if 'sculpt.brush.library_replace_slot' not in command_block:
-              marker = '            response = {"ok": True, "result": result}\n'
-              insert = (
-                  '            response = {"ok": True, "result": result}\n'
-                  '            if command_id == "sculpt.brush.library_replace_slot":\n'
-                  '                response["state"] = self._sculpt_visual_state()\n'
-              )
-              if marker not in command_block:
-                  raise SystemExit('bridge command response marker missing')
-              command_block = command_block.replace(marker, insert, 1)
+          special = '"sculpt.brush.library_replace_slot"'
+          if special not in command_block:
+              mode_marker = '            if satellite_client and command_id in {"sculpt.enter", "sculpt.exit_to_object"}:\n'
+              plain_marker = '            if not satellite_client:\n'
+              if mode_marker in command_block:
+                  replacement = (
+                      '            if command_id == "sculpt.brush.library_replace_slot":\n'
+                      '                response["state"] = self._sculpt_visual_state()\n'
+                      '            elif satellite_client and command_id in {"sculpt.enter", "sculpt.exit_to_object"}:\n'
+                  )
+                  command_block = command_block.replace(mode_marker, replacement, 1)
+              elif plain_marker in command_block:
+                  replacement = (
+                      '            if command_id == "sculpt.brush.library_replace_slot":\n'
+                      '                response["state"] = self._sculpt_visual_state()\n'
+                      '            elif not satellite_client:\n'
+                  )
+                  command_block = command_block.replace(plain_marker, replacement, 1)
+              else:
+                  raise SystemExit('bridge command snapshot branch missing')
               b = b[:command_start] + command_block + b[command_return:]
 
           compile(b, str(bridge), 'exec')
