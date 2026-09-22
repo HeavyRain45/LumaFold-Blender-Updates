@@ -1,0 +1,247 @@
+name: Build LumaFold 0.8.49 V29 Quick Brush Open Anchor
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build-lumafold-0849-v29-quickbrush-open-anchor.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch V28
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $py = Join-Path $env:RUNNER_TEMP 'v29.py'
+          @'
+          import pathlib, zipfile, shutil, hashlib, os
+
+          root = pathlib.Path.cwd()
+          src = root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v28-native-shift-snap-route.zip'
+          out = root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v29-quickbrush-open-anchor.zip'
+          work = pathlib.Path(os.environ['RUNNER_TEMP'])/'lf_v29'
+          shutil.rmtree(work, ignore_errors=True)
+          work.mkdir(parents=True)
+          with zipfile.ZipFile(src) as z:
+              z.extractall(work)
+
+          # ==============================================================
+          # A) Embedded Quick Brush anchor
+          #
+          # Root cause:
+          # _open_targeted_library stores the clicked Quick Brush tile anchor,
+          # but the frozen foundation later overwrote the same state key every
+          # frame with the bottom "笔刷库" button anchor before begin_popup().
+          #
+          # Only the bottom button's actual click is allowed to replace the
+          # anchor. A targeted Quick Brush open keeps its own tile anchor.
+          # ==============================================================
+          foundation = work/'ui/sculpt_view_foundation.py'
+          f = foundation.read_text(encoding='utf-8').replace('\r\n','\n')
+
+          old_anchor = '''    brush_library_clicked = button(imgui, "笔刷库", scale, bottom_w / scale)
+              brush_anchor = _item_anchor(imgui, scale)
+              surface_state["sculpt_brush_library_anchor"] = dict(brush_anchor)
+              if brush_library_clicked:
+                  if on_open_brush_library is not None:
+                      on_open_brush_library(dict(brush_anchor))
+                  else:
+                      popup_name = "LumaFold Brush Library##foundation"
+                      try:
+                          if imgui.is_popup_open(popup_name):
+                              surface_state["sculpt_brush_library_popup_close_requested"] = True
+                          else:
+                              imgui.open_popup(popup_name)
+                      except Exception:
+                          imgui.open_popup(popup_name)
+          '''
+          new_anchor = '''    brush_library_clicked = button(imgui, "笔刷库", scale, bottom_w / scale)
+              brush_anchor = _item_anchor(imgui, scale)
+              if brush_library_clicked:
+                  # The bottom button owns the anchor only when it is the actual
+                  # opener. Do not overwrite a Quick Brush targeted-open anchor
+                  # later in the same frame.
+                  surface_state["sculpt_brush_library_anchor"] = dict(brush_anchor)
+                  if on_open_brush_library is not None:
+                      on_open_brush_library(dict(brush_anchor))
+                  else:
+                      popup_name = "LumaFold Brush Library##foundation"
+                      try:
+                          if imgui.is_popup_open(popup_name):
+                              surface_state["sculpt_brush_library_popup_close_requested"] = True
+                          else:
+                              imgui.open_popup(popup_name)
+                      except Exception:
+                          imgui.open_popup(popup_name)
+          '''
+          if old_anchor not in f:
+              raise SystemExit('foundation brush anchor block not found')
+          f = f.replace(old_anchor, new_anchor, 1)
+          compile(f, str(foundation), 'exec')
+          foundation.write_text(f, encoding='utf-8', newline='\n')
+
+          # ==============================================================
+          # B) Satellite Secondary OPEN must be truly idempotent
+          #
+          # Root cause:
+          # product open_surface() first checked visibility, then called the
+          # legacy toggle function. ShowWindowAsync can complete between those
+          # two operations, so a repeated V27 press/release OPEN could enter the
+          # toggle's "same kind visible => hide" branch and immediately hide the
+          # Brush Library.
+          #
+          # Add an open_only flag at the runtime boundary. Product OPEN and the
+          # async pending flush both use open_only=True. Legacy toggle callers
+          # retain old toggle behavior.
+          # ==============================================================
+          runtime = work/'desktop/satellite_host_runtime.py'
+          r = runtime.read_text(encoding='utf-8').replace('\r\n','\n')
+
+          old_sig = 'def _toggle_secondary_surface(kind="brush_library", anchor=None):\n'
+          new_sig = 'def _toggle_secondary_surface(kind="brush_library", anchor=None, *, open_only=False):\n'
+          if old_sig not in r:
+              raise SystemExit('secondary toggle signature not found')
+          r = r.replace(old_sig, new_sig, 1)
+
+          old_visible = '''    is_visible = bool(user32.IsWindowVisible(hwnd))
+              if is_visible and secondary_kind == kind:
+                  _hide_secondary_surface()
+                  return proc
+          '''
+          new_visible = '''    is_visible = bool(user32.IsWindowVisible(hwnd))
+              if is_visible and secondary_kind == kind:
+                  if bool(open_only):
+                      # Product OPEN is idempotent even if ShowWindowAsync from
+                      # a prior request became visible between visibility checks.
+                      return proc
+                  _hide_secondary_surface()
+                  return proc
+          '''
+          if old_visible not in r:
+              raise SystemExit('secondary visible toggle block not found')
+          r = r.replace(old_visible, new_visible, 1)
+
+          old_flush = '''    secondary_pending_request = None
+              kind, anchor = pending
+              _toggle_secondary_surface(kind, anchor)
+          '''
+          new_flush = '''    secondary_pending_request = None
+              kind, anchor = pending
+              _toggle_secondary_surface(kind, anchor, open_only=True)
+          '''
+          if old_flush not in r:
+              raise SystemExit('secondary pending flush block not found')
+          r = r.replace(old_flush, new_flush, 1)
+
+          compile(r, str(runtime), 'exec')
+          runtime.write_text(r, encoding='utf-8', newline='\n')
+
+          session = work/'desktop/secondary_surface_session.py'
+          s = session.read_text(encoding='utf-8').replace('\r\n','\n')
+          old_call = '    return runtime._toggle_secondary_surface(kind, anchor)\n'
+          new_call = '    return runtime._toggle_secondary_surface(kind, anchor, open_only=True)\n'
+          if old_call not in s:
+              raise SystemExit('secondary product open call not found')
+          s = s.replace(old_call, new_call, 1)
+          compile(s, str(session), 'exec')
+          session.write_text(s, encoding='utf-8', newline='\n')
+
+          # ==============================================================
+          # Regression gates
+          # ==============================================================
+          view = (work/'ui/sculpt_view.py').read_text(encoding='utf-8')
+          secondary = (work/'desktop/secondary_surface_host.py').read_text(encoding='utf-8')
+          nav = (work/'runtime/sculpt_navigation.py').read_text(encoding='utf-8')
+          pointer = (work/'runtime/sculpt_native_pointer.py').read_text(encoding='utf-8')
+          mask = (work/'runtime/sculpt_mask_gesture.py').read_text(encoding='utf-8')
+          route = (work/'runtime/sculpt_route_truth.py').read_text(encoding='utf-8')
+          sat = (work/'desktop/satellite_host.py').read_text(encoding='utf-8')
+
+          # V27 first-click targeted open remains.
+          assert 'pressed_preview = False' in view
+          assert 'imgui_arg.is_mouse_clicked(0)' in view
+          assert '_open_targeted_library(int(ident)' in view
+
+          # Embedded targeted anchor cannot be overwritten by the bottom button
+          # unless that bottom button itself was clicked.
+          block_start = f.index('brush_library_clicked = button(imgui, "笔刷库"')
+          block_end = f.index('imgui.same_line(spacing=bottom_gap)', block_start)
+          anchor_block = f[block_start:block_end]
+          assert 'if brush_library_clicked:' in anchor_block
+          assert anchor_block.index('if brush_library_clicked:') < anchor_block.index('surface_state["sculpt_brush_library_anchor"]')
+
+          # Satellite OPEN and pending-open flush are open-only.
+          assert 'def _toggle_secondary_surface(kind="brush_library", anchor=None, *, open_only=False):' in r
+          assert 'if bool(open_only):' in r
+          assert '_toggle_secondary_surface(kind, anchor, open_only=True)' in r
+          assert 'runtime._toggle_secondary_surface(kind, anchor, open_only=True)' in s
+
+          # V28 native Shift snap path is frozen.
+          assert 'def invoke_blender_rotate(target) -> bool:' in nav
+          assert 'AXIS_SNAP_ENABLE' in nav and 'AXIS_SNAP_DISABLE' in nav
+          assert 'LEFT_SHIFT' in nav and 'RIGHT_SHIFT' in nav
+          assert 'getattr(navigation, "invoke_blender_rotate", None)' in pointer
+          assert 'bpy.ops.view3d.rotate("INVOKE_DEFAULT")' not in pointer
+
+          # Preserve V25 preview / V23a Mask / Satellite first-stroke chain.
+          assert 'on_request_preview=_request_brush_previews_exact' in secondary
+          assert '_BRUSH_PREVIEW_QUEUE_LIMIT = 4' in secondary
+          assert 'clean_age >= 0.18' in secondary
+          assert '_CLASSES = (LUMAFOLD_OT_sculpt_mask_gesture_v2,)' in mask
+          assert 'mask_feather_tap' in mask
+          assert 'mask_sharpen_tap' in mask
+          assert 'background_invert_tap' in mask
+          assert 'satellite_pointer_guard' in route
+          assert 'satellite_client_pointer_reprime' in sat
+          assert '_restore_blender_foreground_if_satellite_activated()' in sat
+          assert '_mirror_quick_shortcut_selection()' in sat
+
+          for py in work.rglob('*.py'):
+              compile(py.read_text(encoding='utf-8'), str(py), 'exec')
+
+          out.unlink(missing_ok=True)
+          with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+              for file in sorted(work.rglob('*')):
+                  if file.is_file():
+                      z.write(file, file.relative_to(work).as_posix())
+
+          digest = hashlib.sha256(out.read_bytes()).hexdigest()
+          out.with_suffix(out.suffix+'.sha256.txt').write_text(
+              f'{digest}  {out.name}\n', encoding='utf-8'
+          )
+          print('SHA256', digest)
+          '@ | Set-Content $py -Encoding UTF8
+          python $py
+
+      - name: Blender 5.2.0 and 5.2.2 extension validation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pkg = (Resolve-Path "$PWD/manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v29-quickbrush-open-anchor.zip").Path
+          foreach ($v in @('5.2.0','5.2.2')) {
+            $z = Join-Path $env:RUNNER_TEMP "blender-$v.zip"
+            $d = Join-Path $env:RUNNER_TEMP "blender-$v"
+            curl.exe -L --fail --retry 3 "https://download.blender.org/release/Blender5.2/blender-$v-windows-x64.zip" -o $z
+            if ($LASTEXITCODE -ne 0) { throw "Blender $v download failed" }
+            Expand-Archive $z $d -Force
+            $exe = Get-ChildItem $d -Filter blender.exe -Recurse | Select-Object -First 1
+            if (-not $exe) { throw "Blender $v executable missing" }
+            & $exe.FullName --command extension validate $pkg
+            if ($LASTEXITCODE -ne 0) { throw "Blender $v validation failed" }
+          }
+
+      - name: Publish
+        shell: pwsh
+        run: |
+          git config user.name 'LumaFold Build Bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v29-quickbrush-open-anchor.zip*
+          git commit -m "candidate: make Quick Brush open idempotent and preserve tile anchor"
+          git push origin HEAD:main
