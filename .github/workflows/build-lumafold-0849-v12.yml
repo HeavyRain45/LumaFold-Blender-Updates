@@ -32,21 +32,15 @@ jobs:
           # so GetAsyncKeyState can still report "up" and the keeper steals focus
           # before ImGui receives a complete click. This is why the Satellite ->
           # Embedded host button can require many clicks.
-          old='''    if int(msg) == WM_MOUSEACTIVATE and not _interactions.shortcut_capture_active():
-              _prime_pointer_focus()
-              _restore_blender_foreground_if_satellite_activated()
-              return MA_NOACTIVATE
-          '''
-          new='''    if int(msg) == WM_MOUSEACTIVATE and not _interactions.shortcut_capture_active():
-              _prime_pointer_focus()
-              # Do not restore Blender foreground here. WM_MOUSEACTIVATE precedes
-              # the actual button-down event; returning foreground at this point
-              # can split an ImGui click before press/release completes.
-              return MA_NOACTIVATE
-          '''
-          if old not in t:
-              raise SystemExit('V11 WM_MOUSEACTIVATE keeper block not found')
-          t=t.replace(old,new,1)
+          fn=t.index("def _wndproc_with_shortcut_capture")
+          ma=t.index("if int(msg) == WM_MOUSEACTIVATE",fn)
+          ma_return=t.index("return MA_NOACTIVATE",ma)
+          ma_block=t[ma:ma_return]
+          keeper_line="        _restore_blender_foreground_if_satellite_activated()\n"
+          if keeper_line not in ma_block:
+              raise SystemExit("V11 WM_MOUSEACTIVATE keeper call not found")
+          ma_block=ma_block.replace(keeper_line,"",1)
+          t=t[:ma]+ma_block+t[ma_return:]
 
           # The V10/V11 first-stroke fix remains: foreground is restored only at
           # the post-draw frame boundary after Satellite has consumed the click.
