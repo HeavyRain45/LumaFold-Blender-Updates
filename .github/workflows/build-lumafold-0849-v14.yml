@@ -200,26 +200,22 @@ jobs:
           nw_end = s.index('\ndef _queue_command', nw)
           nw_block = s[nw:nw_end]
           if 'WM_APP_PRIMARY_BRUSH_VISUAL_SYNC' not in nw_block:
-              needle = '''                with state_lock:
-                      bridge_state = snapshot
-                      ui_state = dict(((snapshot.get("module_state") or {}).get("__ui__") or {}))
-                      requested = float(ui_state.get("ui_scale", ui_state.get("requested_scale", current_scale)) or current_scale)
-                      current_scale = max(0.85, min(2.0, requested))
-          '''
-              repl = needle + '''                if (
-                      str(payload.get("action") or "") == "command"
-                      and str(payload.get("command_id") or "") == "sculpt.brush.library_activate"
-                      and int(ARGS.owner_hwnd or 0)
-                  ):
-                      user32.PostMessageW(
-                          HWND(int(ARGS.owner_hwnd)),
-                          WM_APP_PRIMARY_BRUSH_VISUAL_SYNC,
-                          0, 0,
-                      )
-          '''
+              needle = '                    current_scale = max(0.85, min(2.0, requested))\n'
+              notify = (
+                  '                if (\n'
+                  '                    str(payload.get("action") or "") == "command"\n'
+                  '                    and str(payload.get("command_id") or "") == "sculpt.brush.library_activate"\n'
+                  '                    and int(ARGS.owner_hwnd or 0)\n'
+                  '                ):\n'
+                  '                    user32.PostMessageW(\n'
+                  '                        HWND(int(ARGS.owner_hwnd)),\n'
+                  '                        WM_APP_PRIMARY_BRUSH_VISUAL_SYNC,\n'
+                  '                        0, 0,\n'
+                  '                    )\n'
+              )
               if needle not in nw_block:
-                  raise SystemExit('secondary network response anchor missing')
-              nw_block = nw_block.replace(needle, repl, 1)
+                  raise SystemExit('secondary current_scale response anchor missing')
+              nw_block = nw_block.replace(needle, needle + notify, 1)
               s = s[:nw] + nw_block + s[nw_end:]
 
           if 'def _activate_brush_library_product(' not in s:
