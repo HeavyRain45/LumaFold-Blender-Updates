@@ -1,0 +1,375 @@
+name: Build LumaFold 0.8.49 V25 Secondary Preview Stable
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build-lumafold-0849-v25-secondary-preview-stable.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch V23a with deterministic Secondary preview requests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $py = Join-Path $env:RUNNER_TEMP 'v25.py'
+          @'
+          import pathlib, zipfile, shutil, hashlib, os
+
+          root = pathlib.Path.cwd()
+          src = root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v23a-mask-tap-satellite-hitguard.zip'
+          out = root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v25-secondary-preview-stable.zip'
+          work = pathlib.Path(os.environ['RUNNER_TEMP'])/'lf_v25'
+          shutil.rmtree(work, ignore_errors=True)
+          work.mkdir(parents=True)
+          with zipfile.ZipFile(src) as z:
+              z.extractall(work)
+
+          # ==============================================================
+          # ROOT CAUSE:
+          # The shared gallery marks up to 16 visible ids as "requested".
+          # preview_scheduler intentionally completes only 2 synchronously and
+          # queues the rest. V16 correctly removed the old 120ms get_state poll,
+          # so queued completions no longer produce a Secondary response.
+          # Therefore many ids remain marked requested forever and never retry.
+          #
+          # V25 does NOT add another transport protocol. It uses the already
+          # proven sculpt.brush.library_preview command, but queues ONE identity
+          # per command. That means every gallery "requested" id maps to one
+          # synchronous preview extraction / cache hit and one response.
+          # ==============================================================
+
+          secondary = work/'desktop/secondary_surface_host.py'
+          s = secondary.read_text(encoding='utf-8').replace('\r\n','\n')
+
+          # Bounded request state.
+          global_anchor = '_stable_brush_previews = {}\n_stable_alpha_previews = {}\n'
+          globals_new = (
+              '_stable_brush_previews = {}\n'
+              '_stable_alpha_previews = {}\n'
+              '_brush_preview_pending = set()\n'
+              '_brush_preview_retry_after = {}\n'
+              '_BRUSH_PREVIEW_QUEUE_LIMIT = 4\n'
+              '_BRUSH_PREVIEW_RETRY_SECONDS = 0.75\n'
+              '_outside_visible_since = 0.0\n'
+          )
+          if '_BRUSH_PREVIEW_QUEUE_LIMIT = 4' not in s:
+              if global_anchor not in s:
+                  raise SystemExit('secondary stable cache globals anchor missing')
+              s = s.replace(global_anchor, globals_new, 1)
+
+          # Exact one-id command queue. Release gallery flags for anything not
+          # actually enqueued so the next frame can offer it again.
+          if 'def _request_brush_previews_exact(identities):' not in s:
+              anchor = 'def _button_state(vk):\n'
+              helper = (
+                  'def _request_brush_previews_exact(identities):\n'
+                  '    requested_map = _runtime.library_ui_state.setdefault("brush_preview_requested", {})\n'
+                  '    now = _runtime.time.monotonic()\n'
+                  '    values = []\n'
+                  '    for raw in list(identities or ()):\n'
+                  '        identity = str(raw or "")\n'
+                  '        if identity and identity not in values:\n'
+                  '            values.append(identity)\n'
+                  '\n'
+                  '    capacity = max(0, int(_BRUSH_PREVIEW_QUEUE_LIMIT) - len(_brush_preview_pending))\n'
+                  '    queued = 0\n'
+                  '    for identity in values:\n'
+                  '        if identity in _brush_preview_pending:\n'
+                  '            continue\n'
+                  '        if now < float(_brush_preview_retry_after.get(identity, 0.0) or 0.0):\n'
+                  '            requested_map.pop(identity, None)\n'
+                  '            continue\n'
+                  '        if queued >= capacity:\n'
+                  '            requested_map.pop(identity, None)\n'
+                  '            continue\n'
+                  '        _brush_preview_pending.add(identity)\n'
+                  '        try:\n'
+                  '            _runtime.actions.put_nowait({\n'
+                  '                "action": "command",\n'
+                  '                "command_id": "sculpt.brush.library_preview",\n'
+                  '                "kwargs": {"identities": [identity]},\n'
+                  '                "_preview_identity": identity,\n'
+                  '            })\n'
+                  '            queued += 1\n'
+                  '        except Exception:\n'
+                  '            _brush_preview_pending.discard(identity)\n'
+                  '            requested_map.pop(identity, None)\n'
+                  '\n'
+                  '\n'
+                  'def _finish_brush_preview_request(payload, response):\n'
+                  '    identity = str(payload.get("_preview_identity") or "")\n'
+                  '    if not identity:\n'
+                  '        return\n'
+                  '    _brush_preview_pending.discard(identity)\n'
+                  '    requested_map = _runtime.library_ui_state.setdefault("brush_preview_requested", {})\n'
+                  '    requested_map.pop(identity, None)\n'
+                  '\n'
+                  '    found = False\n'
+                  '    if bool(response.get("ok")) and isinstance(response.get("state"), dict):\n'
+                  '        try:\n'
+                  '            sculpt = dict(((response.get("state") or {}).get("module_state") or {}).get("sculpt") or {})\n'
+                  '            cache = dict(sculpt.get("brush_library_preview_cache") or {})\n'
+                  '            found = bool((cache.get(identity) or {}).get("rgba_b64"))\n'
+                  '        except Exception:\n'
+                  '            found = False\n'
+                  '    if found:\n'
+                  '        _brush_preview_retry_after.pop(identity, None)\n'
+                  '    else:\n'
+                  '        _brush_preview_retry_after[identity] = _runtime.time.monotonic() + float(_BRUSH_PREVIEW_RETRY_SECONDS)\n'
+                  '\n'
+                  '\n'
+              )
+              if anchor not in s:
+                  raise SystemExit('secondary button_state anchor missing')
+              s = s.replace(anchor, helper + anchor, 1)
+
+          # Make the event-driven worker use a longer timeout only for a single
+          # preview extraction, and always release pending state even on errors.
+          nw_start = s.index('def _network_worker_watchdog():')
+          nw_end = s.index('\n\n_runtime._network_worker = _network_worker_watchdog', nw_start)
+          nw = s[nw_start:nw_end]
+
+          if '_preview_identity' not in nw:
+              old = '            response = _runtime.request(payload)\n'
+              new = (
+                  '            is_preview = bool(payload.get("_preview_identity"))\n'
+                  '            wire_payload = dict(payload)\n'
+                  '            wire_payload.pop("_preview_identity", None)\n'
+                  '            response = _runtime.request(wire_payload, timeout=(2.80 if is_preview else 1.50))\n'
+              )
+              if old not in nw:
+                  raise SystemExit('secondary request call missing')
+              nw = nw.replace(old, new, 1)
+
+              # Finalize preview pending after normal response handling.
+              marker = '        except Exception:\n            _runtime.time.sleep(0.05)\n'
+              replacement = (
+                  '            if is_preview:\n'
+                  '                _finish_brush_preview_request(payload, response)\n'
+                  '        except Exception:\n'
+                  '            try:\n'
+                  '                if bool(payload.get("_preview_identity")):\n'
+                  '                    _finish_brush_preview_request(payload, {})\n'
+                  '            except Exception:\n'
+                  '                pass\n'
+                  '            _runtime.time.sleep(0.05)\n'
+              )
+              if marker not in nw:
+                  raise SystemExit('secondary worker exception marker missing')
+              nw = nw.replace(marker, replacement, 1)
+              s = s[:nw_start] + nw + s[nw_end:]
+
+          # Replace gallery callback: exact, bounded, retryable.
+          old_cb = 'on_request_preview=lambda identities: _queue_command("sculpt.brush.library_preview", identities=list(identities or ())),'
+          new_cb = 'on_request_preview=_request_brush_previews_exact,'
+          if old_cb in s:
+              s = s.replace(old_cb, new_cb, 1)
+          elif new_cb not in s:
+              raise SystemExit('secondary brush preview callback missing')
+
+          # Stable child payload residency. 96 covers the 64 Essentials brushes
+          # plus a useful custom-library window without unbounded Base64 growth.
+          s = s.replace(
+              'sculpt["brush_library_preview_cache"] = _merge_cache(_stable_brush_previews, brush, 192)',
+              'sculpt["brush_library_preview_cache"] = _merge_cache(_stable_brush_previews, brush, 96)',
+          )
+
+          # --------------------------------------------------------------
+          # First-open disappearance: GetAsyncKeyState low-bit can still contain
+          # the click that OPENED the Secondary. Previously we armed dismissal as
+          # soon as the button was up, then consumed that stale low-bit as a new
+          # outside click. Add a short visible grace and only arm after a clean
+          # no-button frame.
+          # --------------------------------------------------------------
+          dismiss_start = s.index('def _outside_click_dismiss_tick():')
+          dismiss_end = s.index('\n\ndef _merge_cache', dismiss_start)
+          db = s[dismiss_start:dismiss_end]
+          if '_outside_visible_since' not in db:
+              db = db.replace(
+                  '    global _outside_visible_last, _outside_armed\n',
+                  '    global _outside_visible_last, _outside_armed, _outside_visible_since\n',
+                  1,
+              )
+              old_first = (
+                  '    if not _outside_visible_last:\n'
+                  '        _outside_visible_last = True\n'
+                  '        _outside_armed = not any_down\n'
+                  '        for vk, (down, _pressed) in states.items():\n'
+                  '            _outside_down_last[vk] = bool(down)\n'
+                  '        return False\n'
+              )
+              new_first = (
+                  '    if not _outside_visible_last:\n'
+                  '        _outside_visible_last = True\n'
+                  '        _outside_visible_since = _runtime.time.monotonic()\n'
+                  '        _outside_armed = False\n'
+                  '        for vk, (down, _pressed) in states.items():\n'
+                  '            _outside_down_last[vk] = bool(down)\n'
+                  '        return False\n'
+              )
+              if old_first not in db:
+                  raise SystemExit('secondary first-visible dismiss block missing')
+              db = db.replace(old_first, new_first, 1)
+
+              old_arm = (
+                  '    if not _outside_armed:\n'
+                  '        if not any_down:\n'
+                  '            _outside_armed = True\n'
+                  '        for vk, (down, _pressed) in states.items():\n'
+                  '            _outside_down_last[vk] = bool(down)\n'
+                  '        return False\n'
+              )
+              new_arm = (
+                  '    if not _outside_armed:\n'
+                  '        # Consume stale pressed-since bits from the opener and wait\n'
+                  '        # briefly before outside dismissal becomes eligible.\n'
+                  '        clean_age = _runtime.time.monotonic() - float(_outside_visible_since or 0.0)\n'
+                  '        if not any_down and clean_age >= 0.18:\n'
+                  '            _outside_armed = True\n'
+                  '        for vk, (down, _pressed) in states.items():\n'
+                  '            _outside_down_last[vk] = bool(down)\n'
+                  '        return False\n'
+              )
+              if old_arm not in db:
+                  raise SystemExit('secondary dismissal arm block missing')
+              db = db.replace(old_arm, new_arm, 1)
+              s = s[:dismiss_start] + db + s[dismiss_end:]
+
+          compile(s, str(secondary), 'exec')
+          secondary.write_text(s, encoding='utf-8', newline='\n')
+
+          # --------------------------------------------------------------
+          # Initial Secondary state can safely carry a wider rotating cache.
+          # 24 x 64² RGBA Base64 is ~0.5 MiB; response stays below the child's
+          # 2 MiB receive budget while halving first-open missing work.
+          # --------------------------------------------------------------
+          scheduler = work/'runtime/preview_scheduler.py'
+          ps = scheduler.read_text(encoding='utf-8').replace('\r\n','\n')
+          if '_SEND_BRUSH_ITEMS = 12' in ps:
+              ps = ps.replace('_SEND_BRUSH_ITEMS = 12', '_SEND_BRUSH_ITEMS = 24', 1)
+          elif '_SEND_BRUSH_ITEMS = 24' not in ps:
+              raise SystemExit('Secondary rotating Brush delta setting missing')
+          compile(ps, str(scheduler), 'exec')
+          scheduler.write_text(ps, encoding='utf-8', newline='\n')
+
+          # GPU residency: Primary still requests default 256. Secondary passes
+          # max_items=24, so lowering the compatibility floor to 96 bounds the
+          # native child without reducing Primary residency.
+          textures = work/'ui/preview_textures.py'
+          pt = textures.read_text(encoding='utf-8').replace('\r\n','\n')
+          if 'self.max_items = max(192, int(max_items))' in pt:
+              pt = pt.replace(
+                  'self.max_items = max(192, int(max_items))',
+                  'self.max_items = max(96, int(max_items))',
+                  1,
+              )
+          elif 'self.max_items = max(96, int(max_items))' not in pt:
+              raise SystemExit('preview texture residency floor missing')
+          compile(pt, str(textures), 'exec')
+          textures.write_text(pt, encoding='utf-8', newline='\n')
+
+          # Blender-native PreviewCollection: bounded and still comfortably above
+          # the 64 Essentials set.
+          residency = work/'runtime/brush_preview_residency.py'
+          br = residency.read_text(encoding='utf-8').replace('\r\n','\n')
+          if '_MAX_NATIVE_ITEMS = 192' in br:
+              br = br.replace('_MAX_NATIVE_ITEMS = 192', '_MAX_NATIVE_ITEMS = 128', 1)
+          elif '_MAX_NATIVE_ITEMS = 128' not in br:
+              raise SystemExit('native preview residency bound missing')
+          compile(br, str(residency), 'exec')
+          residency.write_text(br, encoding='utf-8', newline='\n')
+
+          # ==============================================================
+          # Regression + memory gates
+          # ==============================================================
+          mask = (work/'runtime/sculpt_mask_gesture.py').read_text(encoding='utf-8')
+          route = (work/'runtime/sculpt_route_truth.py').read_text(encoding='utf-8')
+          sat = (work/'desktop/satellite_host.py').read_text(encoding='utf-8')
+          sat_rt = (work/'desktop/satellite_host_runtime.py').read_text(encoding='utf-8')
+          bridge = (work/'desktop/bridge_server.py').read_text(encoding='utf-8')
+
+          assert 'on_request_preview=_request_brush_previews_exact' in s
+          assert '"identities": [identity]' in s
+          assert '_BRUSH_PREVIEW_QUEUE_LIMIT = 4' in s
+          assert 'timeout=(2.80 if is_preview else 1.50)' in s
+          assert '_finish_brush_preview_request(payload, {})' in s
+          assert 'clean_age >= 0.18' in s
+          assert '_SEND_BRUSH_ITEMS = 24' in ps
+          assert 'self.max_items = max(96, int(max_items))' in pt
+          assert '_MAX_NATIVE_ITEMS = 128' in br
+
+          # Do not reintroduce idle full-state polling.
+          worker = s[s.index('def _network_worker_watchdog'):s.index('_runtime._network_worker = _network_worker_watchdog')]
+          assert 'payload = {"action": "get_state"}' not in worker
+
+          # Preserve accepted Mask, Satellite hit guard, first-stroke and preview fixes.
+          assert '_CLASSES = (LUMAFOLD_OT_sculpt_mask_gesture_v2,)' in mask
+          assert 'mask_feather_tap' in mask
+          assert 'mask_sharpen_tap' in mask
+          assert 'background_invert_tap' in mask
+          assert 'satellite_pointer_guard' in route
+          assert 'satellite_client_pointer_reprime' in sat
+          assert '_restore_blender_foreground_if_satellite_activated()' in sat
+          assert '_mirror_quick_shortcut_selection()' in sat
+          assert 'host_switch_hit_test(x, y)' in sat
+          assert 'if key == "brush_preview_cache":' in sat_rt
+          assert 'def _sculpt_visual_state(self):' in bridge
+
+          # Approximate thumbnail payload bounds (not total process RSS).
+          rgba = 64 * 64 * 4
+          b64 = ((rgba + 2) // 3) * 4
+          print('SECONDARY_CPU_BRUSH_B64_MAX_MIB', round(96 * b64 / 1024 / 1024, 2))
+          print('SECONDARY_GPU_RGBA_MAX_MIB', round(96 * rgba / 1024 / 1024, 2))
+          print('NATIVE_BRUSH_RESIDENT_MAX', 128)
+          print('PREVIEW_COMMAND_QUEUE_LIMIT', 4)
+
+          for f in work.rglob('*.py'):
+              compile(f.read_text(encoding='utf-8'), str(f), 'exec')
+
+          out.unlink(missing_ok=True)
+          with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+              for f in sorted(work.rglob('*')):
+                  if f.is_file():
+                      z.write(f, f.relative_to(work).as_posix())
+
+          digest = hashlib.sha256(out.read_bytes()).hexdigest()
+          out.with_suffix(out.suffix+'.sha256.txt').write_text(
+              f'{digest}  {out.name}\n', encoding='utf-8'
+          )
+          print('SHA256', digest)
+          '@ | Set-Content $py -Encoding UTF8
+          python $py
+
+      - name: Blender 5.2.0 and 5.2.2 extension validation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pkg = (Resolve-Path "$PWD/manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v25-secondary-preview-stable.zip").Path
+          foreach ($v in @('5.2.0','5.2.2')) {
+            $z = Join-Path $env:RUNNER_TEMP "blender-$v.zip"
+            $d = Join-Path $env:RUNNER_TEMP "blender-$v"
+            curl.exe -L --fail --retry 3 "https://download.blender.org/release/Blender5.2/blender-$v-windows-x64.zip" -o $z
+            if ($LASTEXITCODE -ne 0) { throw "Blender $v download failed" }
+            Expand-Archive $z $d -Force
+            $exe = Get-ChildItem $d -Filter blender.exe -Recurse | Select-Object -First 1
+            if (-not $exe) { throw "Blender $v executable missing" }
+            & $exe.FullName --command extension validate $pkg
+            if ($LASTEXITCODE -ne 0) { throw "Blender $v validation failed" }
+          }
+
+      - name: Publish
+        shell: pwsh
+        run: |
+          git config user.name 'LumaFold Build Bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v25-secondary-preview-stable.zip*
+          git commit -m "candidate: deterministic bounded Secondary preview loading"
+          git push origin HEAD:main
