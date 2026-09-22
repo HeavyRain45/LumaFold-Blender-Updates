@@ -1,0 +1,110 @@
+name: Build LumaFold 0.8.49 V12
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build-lumafold-0849-v12.yml']
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch V11
+        shell: pwsh
+        run: |
+          $py = Join-Path $env:RUNNER_TEMP 'v12.py'
+          @'
+          import pathlib, zipfile, shutil, hashlib, os
+          root=pathlib.Path.cwd()
+          src=root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v11.zip'
+          out=root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v12.zip'
+          work=pathlib.Path(os.environ['RUNNER_TEMP'])/'lf_v12'
+          shutil.rmtree(work,ignore_errors=True); work.mkdir()
+          with zipfile.ZipFile(src) as z: z.extractall(work)
+
+          p=work/'desktop/satellite_host.py'
+          t=p.read_text(encoding='utf-8').replace('\r\n','\n')
+
+          # V11 still restored Blender foreground inside WM_MOUSEACTIVATE.
+          # WM_MOUSEACTIVATE arrives before the corresponding button-down message,
+          # so GetAsyncKeyState can still report "up" and the keeper steals focus
+          # before ImGui receives a complete click. This is why the Satellite ->
+          # Embedded host button can require many clicks.
+          old='''    if int(msg) == WM_MOUSEACTIVATE and not _interactions.shortcut_capture_active():
+              _prime_pointer_focus()
+              _restore_blender_foreground_if_satellite_activated()
+              return MA_NOACTIVATE
+          '''
+          new='''    if int(msg) == WM_MOUSEACTIVATE and not _interactions.shortcut_capture_active():
+              _prime_pointer_focus()
+              # Do not restore Blender foreground here. WM_MOUSEACTIVATE precedes
+              # the actual button-down event; returning foreground at this point
+              # can split an ImGui click before press/release completes.
+              return MA_NOACTIVATE
+          '''
+          if old not in t:
+              raise SystemExit('V11 WM_MOUSEACTIVATE keeper block not found')
+          t=t.replace(old,new,1)
+
+          # The V10/V11 first-stroke fix remains: foreground is restored only at
+          # the post-draw frame boundary after Satellite has consumed the click.
+          frame='''    result = _original_draw_frame()
+              _sync_target_slot_to_secondary()
+              _sync_shortcut_focus_policy()
+              _restore_blender_foreground_if_satellite_activated()
+          '''
+          if frame not in t:
+              raise SystemExit('post-draw foreground keeper missing')
+
+          # Shortcut-capture exception and visual quick-slot mirror must remain.
+          if 'if _interactions.shortcut_capture_active():' not in t:
+              raise SystemExit('shortcut capture focus exception lost')
+          if '_mirror_quick_shortcut_selection()' not in t:
+              raise SystemExit('V11 quick-slot visual mirror lost')
+
+          compile(t,str(p),'exec')
+          p.write_text(t,encoding='utf-8',newline='\n')
+
+          # Preserve all accepted contracts.
+          rt=(work/'desktop/satellite_host_runtime.py').read_text(encoding='utf-8')
+          sec=(work/'desktop/secondary_surface_host_runtime.py').read_text(encoding='utf-8')
+          panels=(work/'panels.py').read_text(encoding='utf-8')
+          bridge=(work/'desktop/bridge_server.py').read_text(encoding='utf-8')
+          launcher=(work/'desktop/launcher.py').read_text(encoding='utf-8')
+          manifest=(work/'blender_manifest.toml').read_text(encoding='utf-8')
+          assert 'WS_EX_NOACTIVATE = 0x08000000' in rt
+          assert 'SW_SHOWNOACTIVATE' in rt
+          assert 'WS_EX_NOACTIVATE = 0x08000000' in sec
+          assert 'class LUMAFOLD_Preferences' in panels
+          assert 'satellite_client and command_id in {"sculpt.enter", "sculpt.exit_to_object"}' in bridge
+          assert '_active_slimgui_import_root' in launcher
+          assert 'wheels/slimgui-0.8.2-cp312-abi3-win_amd64.whl' in manifest
+
+          out.unlink(missing_ok=True)
+          with zipfile.ZipFile(out,'w',zipfile.ZIP_DEFLATED,compresslevel=9) as z:
+              for f in sorted(work.rglob('*')):
+                  if f.is_file(): z.write(f,f.relative_to(work).as_posix())
+          h=hashlib.sha256(out.read_bytes()).hexdigest()
+          out.with_suffix(out.suffix+'.sha256.txt').write_text(f'{h}  {out.name}\n',encoding='utf-8')
+          print(h)
+          '@ | Set-Content $py -Encoding UTF8
+          python $py
+      - name: Validate
+        shell: pwsh
+        run: |
+          $v='5.2.2'; $z="$env:RUNNER_TEMP\blender.zip"; $d="$env:RUNNER_TEMP\blender"
+          curl.exe -L --fail "https://download.blender.org/release/Blender5.2/blender-$v-windows-x64.zip" -o $z
+          Expand-Archive $z $d -Force
+          $exe=Get-ChildItem $d -Filter blender.exe -Recurse | Select-Object -First 1
+          & $exe.FullName --command extension validate "$PWD/manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v12.zip"
+          if ($LASTEXITCODE -ne 0) { throw 'validation failed' }
+      - name: Publish
+        shell: pwsh
+        run: |
+          git config user.name 'LumaFold Build Bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v12.zip*
+          git commit -m "candidate: defer foreground restore until Satellite click completes"
+          git push origin HEAD:main
