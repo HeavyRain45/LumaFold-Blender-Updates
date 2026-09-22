@@ -43,26 +43,25 @@ jobs:
 
           if 'def replace_library_asset_in_slot(' not in m:
               anchor = '    def toggle_library_favorite(identity: str):\n'
-              fn = '''    def replace_library_asset_in_slot(identity: str, slot: int = 0):
-                  """Atomically activate one library Brush and persist that real Brush into one Quick Slot."""
-                  slot = int(slot)
-                  # Activate first so Blender is the authority for the final asset identity.
-                  activate_library_asset(str(identity))
-                  # Persist the exact active Blender Brush (including its preview identity)
-                  # into the requested slot. This avoids library-spec/current-brush
-                  # identity drift and makes preview cache ownership deterministic.
-                  result = assign_current_to_slot(slot)
-                  state["quick_slot"] = slot
-                  state["active_quick_slot"] = slot
-                  state["brush_action_status"] = result
-                  app.events.emit(
-                      "sculpt.brush_library.replaced_slot",
-                      {"slot": slot, "identity": str(identity), "name": str(state.get("current_brush_name") or "")},
-                  )
-                  return result
-
-
-              '''
+              fn = (
+                  '    def replace_library_asset_in_slot(identity: str, slot: int = 0):\n'
+                  '        """Atomically activate one library Brush and persist that real Brush into one Quick Slot."""\n'
+                  '        slot = int(slot)\n'
+                  '        # Activate first so Blender is the authority for the final asset identity.\n'
+                  '        activate_library_asset(str(identity))\n'
+                  '        # Persist the exact active Blender Brush into the requested slot.\n'
+                  '        result = assign_current_to_slot(slot)\n'
+                  '        state["quick_slot"] = slot\n'
+                  '        state["active_quick_slot"] = slot\n'
+                  '        state["brush_action_status"] = result\n'
+                  '        app.events.emit(\n'
+                  '            "sculpt.brush_library.replaced_slot",\n'
+                  '            {"slot": slot, "identity": str(identity), "name": str(state.get("current_brush_name") or "")},\n'
+                  '        )\n'
+                  '        return result\n'
+                  '\n'
+                  '\n'
+              )
               if anchor not in m:
                   raise SystemExit('sculpt atomic-command insertion anchor missing')
               m = m.replace(anchor, fn + anchor, 1)
@@ -86,37 +85,38 @@ jobs:
 
           if 'def _sculpt_visual_state(self):' not in b:
               anchor = '    def _process(self, payload):\n'
-              helper = '''    def _sculpt_visual_state(self):
-                  sculpt_state = APP.store.namespace("sculpt")
-                  keys = (
-                      "quick_slot", "quick_brush_slots", "active_quick_slot",
-                      "current_brush_name", "current_brush_asset", "current_brush_type",
-                      "current_brush_preview", "brush_preview_cache",
-                      "brush_sync_status", "brush_action_status",
-                  )
-                  visual = {key: sculpt_state.get(key) for key in keys if key in sculpt_state}
-                  status = APP.modules.status("sculpt")
-                  context = APP.state.context
-                  return {
-                      "module_state": {"sculpt": visual},
-                      "sculpt_status": {
-                          "active": bool(status.active),
-                          "enabled": bool(status.enabled),
-                          "reason": str(status.reason or ""),
-                          "mode": str(context.mode or ""),
-                          "workspace": "",
-                      },
-                      "host_control": {
-                          **HOST_CONTROL.snapshot(),
-                          "satellite_ready": bool(self.satellite_ready),
-                          "satellite_active": bool(self.satellite_active),
-                          "satellite_closing": bool(self.satellite_closing),
-                          "satellite_rect": dict(self.satellite_rect) if isinstance(self.satellite_rect, dict) else None,
-                      },
-                  }
-
-
-              '''
+              helper = (
+                  '    def _sculpt_visual_state(self):\n'
+                  '        sculpt_state = APP.store.namespace("sculpt")\n'
+                  '        keys = (\n'
+                  '            "quick_slot", "quick_brush_slots", "active_quick_slot",\n'
+                  '            "current_brush_name", "current_brush_asset", "current_brush_type",\n'
+                  '            "current_brush_preview", "brush_preview_cache",\n'
+                  '            "brush_sync_status", "brush_action_status",\n'
+                  '        )\n'
+                  '        visual = {key: sculpt_state.get(key) for key in keys if key in sculpt_state}\n'
+                  '        status = APP.modules.status("sculpt")\n'
+                  '        context = APP.state.context\n'
+                  '        return {\n'
+                  '            "module_state": {"sculpt": visual},\n'
+                  '            "sculpt_status": {\n'
+                  '                "active": bool(status.active),\n'
+                  '                "enabled": bool(status.enabled),\n'
+                  '                "reason": str(status.reason or ""),\n'
+                  '                "mode": str(context.mode or ""),\n'
+                  '                "workspace": "",\n'
+                  '            },\n'
+                  '            "host_control": {\n'
+                  '                **HOST_CONTROL.snapshot(),\n'
+                  '                "satellite_ready": bool(self.satellite_ready),\n'
+                  '                "satellite_active": bool(self.satellite_active),\n'
+                  '                "satellite_closing": bool(self.satellite_closing),\n'
+                  '                "satellite_rect": dict(self.satellite_rect) if isinstance(self.satellite_rect, dict) else None,\n'
+                  '            },\n'
+                  '        }\n'
+                  '\n'
+                  '\n'
+              )
               if anchor not in b:
                   raise SystemExit('bridge _process insertion anchor missing')
               b = b.replace(anchor, helper + anchor, 1)
@@ -170,82 +170,76 @@ jobs:
           # Replace the wrapper's polling watchdog with a true event-driven worker.
           nw_start = s.index('def _network_worker_watchdog():')
           nw_end = s.index('\n\n_runtime._network_worker = _network_worker_watchdog', nw_start)
-          nw_new = '''def _network_worker_watchdog():
-              """Event-driven Secondary transport; no idle full get_state polling."""
-              while not _runtime.closing_event.is_set():
-                  if not _runtime.parent_alive():
-                      _runtime.closing_event.set()
-                      return
-                  try:
-                      payload = _runtime.actions.get(timeout=0.25)
-                  except _runtime.queue.Empty:
-                      continue
-
-                  try:
-                      response = _runtime.request(payload)
-                      if response.get("ok") and isinstance(response.get("state"), dict):
-                          snapshot = dict(response.get("state") or {})
-                          with _runtime.state_lock:
-                              _runtime.bridge_state = snapshot
-                              ui_state = dict(((snapshot.get("module_state") or {}).get("__ui__") or {}))
-                              requested = float(
-                                  ui_state.get(
-                                      "ui_scale",
-                                      ui_state.get("requested_scale", _runtime.current_scale),
-                                  ) or _runtime.current_scale
-                              )
-                              _runtime.current_scale = max(0.85, min(2.0, requested))
-
-                      if (
-                          bool(response.get("ok"))
-                          and str(payload.get("action") or "") == "command"
-                          and str(payload.get("command_id") or "") == "sculpt.brush.library_replace_slot"
-                          and int(_runtime.ARGS.owner_hwnd or 0)
-                      ):
-                          # One event, one visual reconcile in the primary Satellite.
-                          _runtime.user32.PostMessageW(
-                              _runtime.HWND(int(_runtime.ARGS.owner_hwnd)),
-                              WM_APP_PRIMARY_BRUSH_VISUAL_SYNC,
-                              0, 0,
-                          )
-                  except Exception:
-                      _runtime.time.sleep(0.05)
-          '''
+          nw_new = (
+              'def _network_worker_watchdog():\n'
+              '    """Event-driven Secondary transport; no idle full get_state polling."""\n'
+              '    while not _runtime.closing_event.is_set():\n'
+              '        if not _runtime.parent_alive():\n'
+              '            _runtime.closing_event.set()\n'
+              '            return\n'
+              '        try:\n'
+              '            payload = _runtime.actions.get(timeout=0.25)\n'
+              '        except _runtime.queue.Empty:\n'
+              '            continue\n'
+              '\n'
+              '        try:\n'
+              '            response = _runtime.request(payload)\n'
+              '            if response.get("ok") and isinstance(response.get("state"), dict):\n'
+              '                snapshot = dict(response.get("state") or {})\n'
+              '                with _runtime.state_lock:\n'
+              '                    _runtime.bridge_state = snapshot\n'
+              '                    ui_state = dict(((snapshot.get("module_state") or {}).get("__ui__") or {}))\n'
+              '                    requested = float(ui_state.get("ui_scale", ui_state.get("requested_scale", _runtime.current_scale)) or _runtime.current_scale)\n'
+              '                    _runtime.current_scale = max(0.85, min(2.0, requested))\n'
+              '\n'
+              '            if (\n'
+              '                bool(response.get("ok"))\n'
+              '                and str(payload.get("action") or "") == "command"\n'
+              '                and str(payload.get("command_id") or "") == "sculpt.brush.library_replace_slot"\n'
+              '                and int(_runtime.ARGS.owner_hwnd or 0)\n'
+              '            ):\n'
+              '                _runtime.user32.PostMessageW(\n'
+              '                    _runtime.HWND(int(_runtime.ARGS.owner_hwnd)),\n'
+              '                    WM_APP_PRIMARY_BRUSH_VISUAL_SYNC,\n'
+              '                    0, 0,\n'
+              '                )\n'
+              '        except Exception:\n'
+              '            _runtime.time.sleep(0.05)\n'
+          )
           s = s[:nw_start] + nw_new + s[nw_end:]
 
           # Replace the Brush Library callback with one atomic command.
           act_start = s.index('            def _activate_brush(identity):')
           act_end = s.index('\n\n            _runtime.draw_brush_library_foundation(', act_start)
-          act_new = '''            def _activate_brush(identity):
-                  global _target_quick_slot
-                  target = int(_target_quick_slot)
-                  if target < 0:
-                      try:
-                          target = int(sculpt.get("quick_replace_slot", -1))
-                      except Exception:
-                          target = -1
-
-                  if target >= 0:
-                      _queue_command(
-                          "sculpt.brush.library_replace_slot",
-                          identity=str(identity),
-                          slot=int(target),
-                      )
-                      # Clear only after the atomic command has been queued.
-                      _target_quick_slot = -1
-                      try:
-                          _queue_state({"quick_replace_slot": -1})
-                      except Exception:
-                          pass
-                  else:
-                      # Opening the general Brush Library still means "activate only".
-                      _queue_command("sculpt.brush.library_activate", identity=str(identity))
-
-                  try:
-                      _runtime.user32.ShowWindow(_runtime.hwnd_main, _runtime.SW_HIDE)
-                  except Exception:
-                      pass
-          '''
+          act_new = (
+              '            def _activate_brush(identity):\n'
+              '                global _target_quick_slot\n'
+              '                target = int(_target_quick_slot)\n'
+              '                if target < 0:\n'
+              '                    try:\n'
+              '                        target = int(sculpt.get("quick_replace_slot", -1))\n'
+              '                    except Exception:\n'
+              '                        target = -1\n'
+              '\n'
+              '                if target >= 0:\n'
+              '                    _queue_command(\n'
+              '                        "sculpt.brush.library_replace_slot",\n'
+              '                        identity=str(identity),\n'
+              '                        slot=int(target),\n'
+              '                    )\n'
+              '                    _target_quick_slot = -1\n'
+              '                    try:\n'
+              '                        _queue_state({"quick_replace_slot": -1})\n'
+              '                    except Exception:\n'
+              '                        pass\n'
+              '                else:\n'
+              '                    _queue_command("sculpt.brush.library_activate", identity=str(identity))\n'
+              '\n'
+              '                try:\n'
+              '                    _runtime.user32.ShowWindow(_runtime.hwnd_main, _runtime.SW_HIDE)\n'
+              '                except Exception:\n'
+              '                    pass\n'
+          )
           s = s[:act_start] + act_new + s[act_end:]
 
           compile(s, str(secondary), 'exec')
