@@ -1,0 +1,426 @@
+name: Build LumaFold 0.8.49 V16 Clean
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build-lumafold-0849-v16-clean.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rebuild from V13 with clean Satellite ownership
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $py = Join-Path $env:RUNNER_TEMP 'v16_clean.py'
+          @'
+          import pathlib, zipfile, shutil, hashlib, os
+
+          root = pathlib.Path.cwd()
+          src = root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v13.zip'
+          out = root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v16-clean.zip'
+          work = pathlib.Path(os.environ['RUNNER_TEMP'])/'lf_v16_clean'
+          shutil.rmtree(work, ignore_errors=True)
+          work.mkdir(parents=True)
+          with zipfile.ZipFile(src) as z:
+              z.extractall(work)
+
+          # ==============================================================
+          # 1) Core owns one atomic operation:
+          #    activate selected Brush -> assign that *actual* Blender Brush
+          #    to the targeted Quick Slot.
+          #    No two-command race, no identity mismatch.
+          # ==============================================================
+          sculpt = work/'modules/sculpt.py'
+          m = sculpt.read_text(encoding='utf-8').replace('\r\n','\n')
+
+          if 'def replace_library_asset_in_slot(' not in m:
+              anchor = '    def toggle_library_favorite(identity: str):\n'
+              fn = '''    def replace_library_asset_in_slot(identity: str, slot: int = 0):
+                  """Atomically activate one library Brush and persist that real Brush into one Quick Slot."""
+                  slot = int(slot)
+                  # Activate first so Blender is the authority for the final asset identity.
+                  activate_library_asset(str(identity))
+                  # Persist the exact active Blender Brush (including its preview identity)
+                  # into the requested slot. This avoids library-spec/current-brush
+                  # identity drift and makes preview cache ownership deterministic.
+                  result = assign_current_to_slot(slot)
+                  state["quick_slot"] = slot
+                  state["active_quick_slot"] = slot
+                  state["brush_action_status"] = result
+                  app.events.emit(
+                      "sculpt.brush_library.replaced_slot",
+                      {"slot": slot, "identity": str(identity), "name": str(state.get("current_brush_name") or "")},
+                  )
+                  return result
+
+
+              '''
+              if anchor not in m:
+                  raise SystemExit('sculpt atomic-command insertion anchor missing')
+              m = m.replace(anchor, fn + anchor, 1)
+
+          reg_anchor = '    app.commands.register("sculpt.brush.library_assign_slot", assign_asset_to_slot)\n'
+          reg_line = '    app.commands.register("sculpt.brush.library_replace_slot", replace_library_asset_in_slot)\n'
+          if reg_line not in m:
+              if reg_anchor not in m:
+                  raise SystemExit('sculpt command registration anchor missing')
+              m = m.replace(reg_anchor, reg_anchor + reg_line, 1)
+
+          compile(m, str(sculpt), 'exec')
+          sculpt.write_text(m, encoding='utf-8', newline='\n')
+
+          # ==============================================================
+          # 2) Bridge exposes one cached visual-state read.
+          #    It never calls sync_brush_state / Alpha / preview loaders.
+          # ==============================================================
+          bridge = work/'desktop/bridge_server.py'
+          b = bridge.read_text(encoding='utf-8').replace('\r\n','\n')
+
+          if 'def _sculpt_visual_state(self):' not in b:
+              anchor = '    def _process(self, payload):\n'
+              helper = '''    def _sculpt_visual_state(self):
+                  sculpt_state = APP.store.namespace("sculpt")
+                  keys = (
+                      "quick_slot", "quick_brush_slots", "active_quick_slot",
+                      "current_brush_name", "current_brush_asset", "current_brush_type",
+                      "current_brush_preview", "brush_preview_cache",
+                      "brush_sync_status", "brush_action_status",
+                  )
+                  visual = {key: sculpt_state.get(key) for key in keys if key in sculpt_state}
+                  status = APP.modules.status("sculpt")
+                  context = APP.state.context
+                  return {
+                      "module_state": {"sculpt": visual},
+                      "sculpt_status": {
+                          "active": bool(status.active),
+                          "enabled": bool(status.enabled),
+                          "reason": str(status.reason or ""),
+                          "mode": str(context.mode or ""),
+                          "workspace": "",
+                      },
+                      "host_control": {
+                          **HOST_CONTROL.snapshot(),
+                          "satellite_ready": bool(self.satellite_ready),
+                          "satellite_active": bool(self.satellite_active),
+                          "satellite_closing": bool(self.satellite_closing),
+                          "satellite_rect": dict(self.satellite_rect) if isinstance(self.satellite_rect, dict) else None,
+                      },
+                  }
+
+
+              '''
+              if anchor not in b:
+                  raise SystemExit('bridge _process insertion anchor missing')
+              b = b.replace(anchor, helper + anchor, 1)
+
+          if 'if action == "get_sculpt_visual_state":' not in b:
+              anchor = '        if action == "set_state":\n'
+              block = (
+                  '        if action == "get_sculpt_visual_state":\n'
+                  '            return {"ok": True, "state": self._sculpt_visual_state()}\n'
+                  '\n'
+              )
+              if anchor not in b:
+                  raise SystemExit('bridge visual action anchor missing')
+              b = b.replace(anchor, block + anchor, 1)
+
+          # Targeted replacement is the one Secondary command whose response
+          # should be light and state-bearing. This also prevents the Secondary
+          # transport adapter from performing a full get_state immediately after.
+          command_start = b.index('        if action == "command":')
+          command_return = b.index('            return response', command_start)
+          command_block = b[command_start:command_return]
+          if 'sculpt.brush.library_replace_slot' not in command_block:
+              marker = '            response = {"ok": True, "result": result}\n'
+              insert = (
+                  '            response = {"ok": True, "result": result}\n'
+                  '            if command_id == "sculpt.brush.library_replace_slot":\n'
+                  '                response["state"] = self._sculpt_visual_state()\n'
+              )
+              if marker not in command_block:
+                  raise SystemExit('bridge command response marker missing')
+              command_block = command_block.replace(marker, insert, 1)
+              b = b[:command_start] + command_block + b[command_return:]
+
+          compile(b, str(bridge), 'exec')
+          bridge.write_text(b, encoding='utf-8', newline='\n')
+
+          # ==============================================================
+          # 3) Actual Secondary executable wrapper owns targeted replacement.
+          #    IMPORTANT: patch secondary_surface_host.py, not the runtime it
+          #    overrides. Remove its idle full-state watchdog.
+          # ==============================================================
+          secondary = work/'desktop/secondary_surface_host.py'
+          s = secondary.read_text(encoding='utf-8').replace('\r\n','\n')
+
+          if 'WM_APP_PRIMARY_BRUSH_VISUAL_SYNC = 0x8053' not in s:
+              anchor = 'WM_APP_QUICK_REPLACE_SLOT = 0x8052\n'
+              if anchor not in s:
+                  raise SystemExit('secondary message anchor missing')
+              s = s.replace(anchor, anchor + 'WM_APP_PRIMARY_BRUSH_VISUAL_SYNC = 0x8053\n', 1)
+
+          # Replace the wrapper's polling watchdog with a true event-driven worker.
+          nw_start = s.index('def _network_worker_watchdog():')
+          nw_end = s.index('\n\n_runtime._network_worker = _network_worker_watchdog', nw_start)
+          nw_new = '''def _network_worker_watchdog():
+              """Event-driven Secondary transport; no idle full get_state polling."""
+              while not _runtime.closing_event.is_set():
+                  if not _runtime.parent_alive():
+                      _runtime.closing_event.set()
+                      return
+                  try:
+                      payload = _runtime.actions.get(timeout=0.25)
+                  except _runtime.queue.Empty:
+                      continue
+
+                  try:
+                      response = _runtime.request(payload)
+                      if response.get("ok") and isinstance(response.get("state"), dict):
+                          snapshot = dict(response.get("state") or {})
+                          with _runtime.state_lock:
+                              _runtime.bridge_state = snapshot
+                              ui_state = dict(((snapshot.get("module_state") or {}).get("__ui__") or {}))
+                              requested = float(
+                                  ui_state.get(
+                                      "ui_scale",
+                                      ui_state.get("requested_scale", _runtime.current_scale),
+                                  ) or _runtime.current_scale
+                              )
+                              _runtime.current_scale = max(0.85, min(2.0, requested))
+
+                      if (
+                          bool(response.get("ok"))
+                          and str(payload.get("action") or "") == "command"
+                          and str(payload.get("command_id") or "") == "sculpt.brush.library_replace_slot"
+                          and int(_runtime.ARGS.owner_hwnd or 0)
+                      ):
+                          # One event, one visual reconcile in the primary Satellite.
+                          _runtime.user32.PostMessageW(
+                              _runtime.HWND(int(_runtime.ARGS.owner_hwnd)),
+                              WM_APP_PRIMARY_BRUSH_VISUAL_SYNC,
+                              0, 0,
+                          )
+                  except Exception:
+                      _runtime.time.sleep(0.05)
+          '''
+          s = s[:nw_start] + nw_new + s[nw_end:]
+
+          # Replace the Brush Library callback with one atomic command.
+          act_start = s.index('            def _activate_brush(identity):')
+          act_end = s.index('\n\n            _runtime.draw_brush_library_foundation(', act_start)
+          act_new = '''            def _activate_brush(identity):
+                  global _target_quick_slot
+                  target = int(_target_quick_slot)
+                  if target < 0:
+                      try:
+                          target = int(sculpt.get("quick_replace_slot", -1))
+                      except Exception:
+                          target = -1
+
+                  if target >= 0:
+                      _queue_command(
+                          "sculpt.brush.library_replace_slot",
+                          identity=str(identity),
+                          slot=int(target),
+                      )
+                      # Clear only after the atomic command has been queued.
+                      _target_quick_slot = -1
+                      try:
+                          _queue_state({"quick_replace_slot": -1})
+                      except Exception:
+                          pass
+                  else:
+                      # Opening the general Brush Library still means "activate only".
+                      _queue_command("sculpt.brush.library_activate", identity=str(identity))
+
+                  try:
+                      _runtime.user32.ShowWindow(_runtime.hwnd_main, _runtime.SW_HIDE)
+                  except Exception:
+                      pass
+          '''
+          s = s[:act_start] + act_new + s[act_end:]
+
+          compile(s, str(secondary), 'exec')
+          secondary.write_text(s, encoding='utf-8', newline='\n')
+
+          # ==============================================================
+          # 4) Primary Satellite receives exactly one visual-sync event and
+          #    pulls only cached visual state. No idle polling.
+          # ==============================================================
+          host = work/'desktop/satellite_host.py'
+          h = host.read_text(encoding='utf-8').replace('\r\n','\n')
+
+          if 'WM_APP_PRIMARY_BRUSH_VISUAL_SYNC = 0x8053' not in h:
+              anchor = 'WM_APP_QUICK_REPLACE_SLOT = 0x8052\n'
+              if anchor not in h:
+                  raise SystemExit('primary message anchor missing')
+              h = h.replace(anchor, anchor + 'WM_APP_PRIMARY_BRUSH_VISUAL_SYNC = 0x8053\n', 1)
+
+          wnd = h.index('def _wndproc_with_shortcut_capture')
+          wnd_end = h.index('\ndef _button_state', wnd)
+          wnd_block = h[wnd:wnd_end]
+          if 'if int(msg) == WM_APP_PRIMARY_BRUSH_VISUAL_SYNC:' not in wnd_block:
+              marker = '    if int(msg) == int(_runtime.WM_APP_SHOW):\n'
+              handler = (
+                  '    if int(msg) == WM_APP_PRIMARY_BRUSH_VISUAL_SYNC:\n'
+                  '        try:\n'
+                  '            _runtime.actions.put({"action": "get_sculpt_visual_state"})\n'
+                  '        except Exception:\n'
+                  '            pass\n'
+                  '        return 0\n'
+                  '\n'
+              )
+              if marker not in wnd_block:
+                  raise SystemExit('primary visual-sync handler anchor missing')
+              wnd_block = wnd_block.replace(marker, handler + marker, 1)
+              h = h[:wnd] + wnd_block + h[wnd_end:]
+
+          compile(h, str(host), 'exec')
+          host.write_text(h, encoding='utf-8', newline='\n')
+
+          # ==============================================================
+          # 5) Reliable Satellite -> Embedded: native press-edge hit-test.
+          #    This is independent of ImGui click/release/focus history.
+          # ==============================================================
+          interactions = work/'ui/sculpt_interactions.py'
+          t = interactions.read_text(encoding='utf-8').replace('\r\n','\n')
+
+          if '_HOST_SWITCH_RECT = None' not in t:
+              anchor = '_SHORTCUT_CAPTURE_ACTIVE = False\n'
+              if anchor not in t:
+                  raise SystemExit('interaction globals anchor missing')
+              t = t.replace(anchor, anchor + '_HOST_SWITCH_RECT = None\n', 1)
+
+          if 'def host_switch_hit_test(' not in t:
+              anchor = 'def shortcut_capture_active() -> bool:\n    return bool(_SHORTCUT_CAPTURE_ACTIVE)\n\n\n'
+              helper = (
+                  'def host_switch_hit_test(x: float, y: float) -> bool:\n'
+                  '    rect = _HOST_SWITCH_RECT\n'
+                  '    if not rect:\n'
+                  '        return False\n'
+                  '    try:\n'
+                  '        x0, y0, x1, y1 = rect\n'
+                  '        return float(x0) <= float(x) <= float(x1) and float(y0) <= float(y) <= float(y1)\n'
+                  '    except Exception:\n'
+                  '        return False\n'
+                  '\n'
+                  '\n'
+              )
+              if anchor not in t:
+                  raise SystemExit('interaction hit-test insertion anchor missing')
+              t = t.replace(anchor, anchor + helper, 1)
+
+          fstart = t.index('def _host_switch_button(')
+          fend = t.index('\ndef _draw_input_profile_switch', fstart)
+          fb = t[fstart:fend]
+          if 'global _HOST_SWITCH_RECT' not in fb:
+              fb = fb.replace(
+                  'def _host_switch_button(imgui, scale: float, host_label: str, on_toggle_host):\n',
+                  'def _host_switch_button(imgui, scale: float, host_label: str, on_toggle_host):\n    global _HOST_SWITCH_RECT\n',
+                  1,
+              )
+          if '_HOST_SWITCH_RECT = (' not in fb:
+              marker = '    activate = bool(pressed or clicked)\n'
+              capture = (
+                  '    try:\n'
+                  '        rmin = imgui.get_item_rect_min()\n'
+                  '        rmax = imgui.get_item_rect_max()\n'
+                  '        _HOST_SWITCH_RECT = (float(rmin[0]), float(rmin[1]), float(rmax[0]), float(rmax[1]))\n'
+                  '    except Exception:\n'
+                  '        _HOST_SWITCH_RECT = None\n'
+                  '\n'
+              )
+              if marker not in fb:
+                  raise SystemExit('V13 host switch activate marker missing')
+              fb = fb.replace(marker, capture + marker, 1)
+          t = t[:fstart] + fb + t[fend:]
+          compile(t, str(interactions), 'exec')
+          interactions.write_text(t, encoding='utf-8', newline='\n')
+
+          # Native hit-test in the actual Satellite wrapper.
+          h = host.read_text(encoding='utf-8').replace('\r\n','\n')
+          wnd = h.index('def _wndproc_with_shortcut_capture')
+          wnd_end = h.index('\ndef _button_state', wnd)
+          wb = h[wnd:wnd_end]
+          if 'host_switch_hit_test(x, y)' not in wb:
+              first = wb.index('    if ')
+              native = (
+                  '    if int(msg) == int(_runtime.WM_LBUTTONDOWN) and not _interactions.shortcut_capture_active():\n'
+                  '        try:\n'
+                  '            x, y = _runtime._xy(lparam)\n'
+                  '        except Exception:\n'
+                  '            x, y = -1, -1\n'
+                  '        if _interactions.host_switch_hit_test(x, y):\n'
+                  '            _runtime.user32.PostMessageW(hwnd, _runtime.WM_CLOSE, 0, 0)\n'
+                  '            return 0\n'
+                  '\n'
+              )
+              wb = wb[:first] + native + wb[first:]
+              h = h[:wnd] + wb + h[wnd_end:]
+          compile(h, str(host), 'exec')
+          host.write_text(h, encoding='utf-8', newline='\n')
+
+          # ==============================================================
+          # Gates: preserve accepted first-stroke + keyboard quick-slot sync.
+          # ==============================================================
+          rt = (work/'desktop/satellite_host_runtime.py').read_text(encoding='utf-8')
+          panels = (work/'panels.py').read_text(encoding='utf-8')
+          launcher = (work/'desktop/launcher.py').read_text(encoding='utf-8')
+          manifest = (work/'blender_manifest.toml').read_text(encoding='utf-8')
+
+          assert 'WS_EX_NOACTIVATE = 0x08000000' in rt
+          assert 'SW_SHOWNOACTIVATE' in rt
+          assert '_restore_blender_foreground_if_satellite_activated()' in h
+          assert '_mirror_quick_shortcut_selection()' in h
+          assert 'host_switch_hit_test(x, y)' in h
+          assert 'get_sculpt_visual_state' in h
+          assert 'sculpt.brush.library_replace_slot' in s
+          assert 'payload = {"action": "get_state"}' not in s[s.index('def _network_worker_watchdog'):s.index('_runtime._network_worker = _network_worker_watchdog')]
+          assert 'def _sculpt_visual_state(self):' in b
+          assert 'sculpt.brush.library_replace_slot' in m
+          assert 'class LUMAFOLD_Preferences' in panels
+          assert '_active_slimgui_import_root' in launcher
+          assert 'wheels/slimgui-0.8.2-cp312-abi3-win_amd64.whl' in manifest
+
+          out.unlink(missing_ok=True)
+          with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+              for f in sorted(work.rglob('*')):
+                  if f.is_file():
+                      z.write(f, f.relative_to(work).as_posix())
+
+          digest = hashlib.sha256(out.read_bytes()).hexdigest()
+          out.with_suffix(out.suffix+'.sha256.txt').write_text(
+              f'{digest}  {out.name}\n', encoding='utf-8'
+          )
+          print(digest)
+          '@ | Set-Content $py -Encoding UTF8
+          python $py
+
+      - name: Blender 5.2.2 extension validation
+        shell: pwsh
+        run: |
+          $v='5.2.2'
+          $z="$env:RUNNER_TEMP\blender.zip"
+          $d="$env:RUNNER_TEMP\blender"
+          curl.exe -L --fail "https://download.blender.org/release/Blender5.2/blender-$v-windows-x64.zip" -o $z
+          Expand-Archive $z $d -Force
+          $exe=Get-ChildItem $d -Filter blender.exe -Recurse | Select-Object -First 1
+          & $exe.FullName --command extension validate "$PWD/manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v16-clean.zip"
+          if ($LASTEXITCODE -ne 0) { throw 'validation failed' }
+
+      - name: Publish
+        shell: pwsh
+        run: |
+          git config user.name 'LumaFold Build Bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v16-clean.zip*
+          git commit -m "candidate: clean Satellite brush ownership V16"
+          git push origin HEAD:main
