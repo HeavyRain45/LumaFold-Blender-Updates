@@ -40,46 +40,32 @@ jobs:
           runtime = work/'desktop/satellite_host_runtime.py'
           r = runtime.read_text(encoding='utf-8').replace('\r\n','\n')
 
-          loop = '''    for key in (
-              "quick_slot", "quick_brush_slots", "active_quick_slot",
-              "current_brush_name", "current_brush_asset", "current_brush_type",
-              "current_brush_preview", "brush_preview_cache", "brush_sync_status", "brush_action_status",
-              "brush_size", "brush_strength",
-              "current_alpha_name", "current_alpha_identity", "current_alpha_filepath",
-              "current_alpha_map_mode", "current_alpha_preview", "alpha_sync_status",
-          ):
-              if now >= float(local_override_until.get(key, 0.0)) and key in remote:
-                  local_sculpt[key] = remote[key]
-          '''
-          replacement = '''    for key in (
-              "quick_slot", "quick_brush_slots", "active_quick_slot",
-              "current_brush_name", "current_brush_asset", "current_brush_type",
-              "current_brush_preview", "brush_preview_cache", "brush_sync_status", "brush_action_status",
-              "brush_size", "brush_strength",
-              "current_alpha_name", "current_alpha_identity", "current_alpha_filepath",
-              "current_alpha_map_mode", "current_alpha_preview", "alpha_sync_status",
-          ):
-              if now >= float(local_override_until.get(key, 0.0)) and key in remote:
-                  if key == "brush_preview_cache":
-                      # Preview payloads are immutable by asset identity. A
-                      # lightweight response may contain only a subset, so merge
-                      # it into the resident Satellite cache instead of treating
-                      # that subset as the entire truth and blanking other tiles.
-                      merged = dict(local_sculpt.get("brush_preview_cache") or {})
-                      for identity, raw in dict(remote.get("brush_preview_cache") or {}).items():
-                          payload = dict(raw or {})
-                          if payload.get("rgba_b64"):
-                              payload["key"] = str(identity)
-                              merged[str(identity)] = payload
-                      while len(merged) > 48:
-                          merged.pop(next(iter(merged)), None)
-                      local_sculpt["brush_preview_cache"] = merged
-                  else:
-                      local_sculpt[key] = remote[key]
-          '''
-          if loop not in r:
-              raise SystemExit('Satellite local-sync loop not found')
-          r = r.replace(loop, replacement, 1)
+          sync_start = r.index('def _sync_local_from_snapshot')
+          sync_end = r.index('\ndef network_worker', sync_start)
+          sync_block = r[sync_start:sync_end]
+          needle = '            local_sculpt[key] = remote[key]\n'
+          replacement = (
+              '            if key == "brush_preview_cache":\n'
+              '                # A visual response may contain only a preview delta.\n'
+              '                # Merge immutable payloads by asset identity instead of\n'
+              '                # blanking previews already resident in Satellite.\n'
+              '                merged = dict(local_sculpt.get("brush_preview_cache") or {})\n'
+              '                for identity, raw in dict(remote.get("brush_preview_cache") or {}).items():\n'
+              '                    payload = dict(raw or {})\n'
+              '                    if payload.get("rgba_b64"):\n'
+              '                        payload["key"] = str(identity)\n'
+              '                        merged[str(identity)] = payload\n'
+              '                while len(merged) > 48:\n'
+              '                    merged.pop(next(iter(merged)), None)\n'
+              '                local_sculpt["brush_preview_cache"] = merged\n'
+              '            else:\n'
+              '                local_sculpt[key] = remote[key]\n'
+          )
+          if needle not in sync_block:
+              raise SystemExit('Satellite local-sync assignment not found')
+          sync_block = sync_block.replace(needle, replacement, 1)
+          r = r[:sync_start] + sync_block + r[sync_end:]
+
           compile(r, str(runtime), 'exec')
           runtime.write_text(r, encoding='utf-8', newline='\n')
 
