@@ -1,0 +1,231 @@
+name: Build LumaFold 0.8.49 V11
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build-lumafold-0849-v11.yml']
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch V10
+        shell: pwsh
+        run: |
+          $py = Join-Path $env:RUNNER_TEMP 'v11.py'
+          @'
+          import pathlib, zipfile, shutil, hashlib, os
+          root=pathlib.Path.cwd()
+          src=root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v10.zip'
+          out=root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v11.zip'
+          work=pathlib.Path(os.environ['RUNNER_TEMP'])/'lf_v11'
+          shutil.rmtree(work,ignore_errors=True); work.mkdir()
+          with zipfile.ZipFile(src) as z: z.extractall(work)
+
+          p=work/'desktop/satellite_host.py'
+          t=p.read_text(encoding='utf-8').replace('\r\n','\n')
+
+          # 1) V10 foreground keeper was too eager: do not return foreground while
+          # a Satellite mouse/pen button is still held. Let ImGui complete the click,
+          # then return Blender foreground on the first released frame.
+          old='''def _restore_blender_foreground_if_satellite_activated():
+              if _interactions.shortcut_capture_active():
+                  return False
+              try:
+                  fg = int(_runtime.user32.GetForegroundWindow() or 0)
+                  ours = {int(_runtime.hwnd_main or 0), int(_runtime.secondary_hwnd or 0)}
+                  ours.discard(0)
+                  if fg not in ours:
+                      return False
+                  owner = int(_runtime.ARGS.owner_hwnd or 0)
+                  if not owner or not _runtime.user32.IsWindow(_runtime.HWND(owner)):
+                      return False
+                  return bool(_runtime.user32.SetForegroundWindow(_runtime.HWND(owner)))
+              except Exception:
+                  return False
+          '''
+          new='''def _restore_blender_foreground_if_satellite_activated():
+              if _interactions.shortcut_capture_active():
+                  return False
+              try:
+                  fg = int(_runtime.user32.GetForegroundWindow() or 0)
+                  ours = {int(_runtime.hwnd_main or 0), int(_runtime.secondary_hwnd or 0)}
+                  ours.discard(0)
+                  if fg not in ours:
+                      return False
+
+                  # Never steal focus in the middle of an ImGui click. V10 could
+                  # return Blender foreground between press/release, so Host switch
+                  # sometimes needed several clicks. Restore only after release.
+                  for vk in (0x01, 0x02, 0x04):
+                      down, _pressed = _button_state(vk)
+                      if down:
+                          return False
+
+                  owner = int(_runtime.ARGS.owner_hwnd or 0)
+                  if not owner or not _runtime.user32.IsWindow(_runtime.HWND(owner)):
+                      return False
+                  return bool(_runtime.user32.SetForegroundWindow(_runtime.HWND(owner)))
+              except Exception:
+                  return False
+          '''
+          if old not in t:
+              raise SystemExit('V10 foreground keeper block not found')
+          t=t.replace(old,new,1)
+
+          # 2) Mirror Blender-authoritative Quick Brush shortcuts locally in the
+          # Satellite UI. The real shortcut continues to execute in Blender; this
+          # only follows the same global key edge so active_quick_slot redraws
+          # immediately without reintroducing get_state polling/full snapshots.
+          marker='_external_injected = set()\n'
+          globals_block='''_shortcut_mirror_down = {}
+
+
+          def _shortcut_vk(token):
+              token = str(token or "").strip().upper()
+              if len(token) == 1 and "0" <= token <= "9":
+                  return ord(token)
+              if len(token) == 1 and "A" <= token <= "Z":
+                  return ord(token)
+              if token.startswith("NUM") and token[3:].isdigit():
+                  value = int(token[3:])
+                  if 0 <= value <= 9:
+                      return 0x60 + value
+              return 0
+
+
+          def _key_down(vk):
+              try:
+                  return bool(int(_runtime.user32.GetAsyncKeyState(int(vk))) & 0x8000)
+              except Exception:
+                  return False
+
+
+          def _mirror_quick_shortcut_selection():
+              if _interactions.shortcut_capture_active():
+                  return
+              labels = list(_runtime.local_sculpt.get("quick_shortcuts") or ())
+              slots = list(_runtime.local_sculpt.get("quick_brush_slots") or ())
+              if not labels:
+                  return
+
+              ctrl = _key_down(0x11)
+              alt = _key_down(0x12)
+              shift = _key_down(0x10)
+              oskey = _key_down(0x5B) or _key_down(0x5C)
+
+              for slot, raw in enumerate(labels[:16]):
+                  label = str(raw or "").strip()
+                  if not label:
+                      _shortcut_mirror_down[slot] = False
+                      continue
+                  parts = [part.strip() for part in label.split("+") if part.strip()]
+                  if not parts:
+                      _shortcut_mirror_down[slot] = False
+                      continue
+
+                  mods = {part.casefold() for part in parts[:-1]}
+                  key_token = parts[-1]
+                  vk = _shortcut_vk(key_token)
+                  if not vk:
+                      _shortcut_mirror_down[slot] = False
+                      continue
+
+                  expected_ctrl = "ctrl" in mods
+                  expected_alt = "alt" in mods
+                  expected_shift = "shift" in mods
+                  expected_os = "os" in mods
+                  pressed = bool(
+                      _key_down(vk)
+                      and ctrl == expected_ctrl
+                      and alt == expected_alt
+                      and shift == expected_shift
+                      and oskey == expected_os
+                  )
+                  was = bool(_shortcut_mirror_down.get(slot, False))
+                  _shortcut_mirror_down[slot] = pressed
+                  if not pressed or was:
+                      continue
+
+                  # Blender remains the authority and has already received the same
+                  # keymap event. This is a visual mirror only.
+                  _runtime.local_sculpt["quick_slot"] = int(slot)
+                  _runtime.local_sculpt["active_quick_slot"] = int(slot)
+                  if 0 <= slot < len(slots):
+                      spec = dict(slots[slot] or {})
+                      if not bool(spec.get("empty", False)):
+                          _runtime.local_sculpt["current_brush_name"] = str(spec.get("label") or "")
+                          rel = str(spec.get("relative_asset_identifier") or "")
+                          if rel:
+                              _runtime.local_sculpt["current_brush_asset"] = {
+                                  "relative_asset_identifier": rel,
+                                  "full_library_path": str(spec.get("full_library_path") or ""),
+                              }
+                  break
+
+
+          '''
+          if '_mirror_quick_shortcut_selection' not in t:
+              if marker not in t:
+                  raise SystemExit('shortcut mirror insertion marker missing')
+              t=t.replace(marker,marker+globals_block,1)
+
+          # Mirror before draw so the blue selected tile updates in the same frame.
+          frame_marker='''def _draw_frame_with_popup_dismiss():
+              global _preflight_visible
+              _inject_internal_popup_outside_click()
+              _apply_theme_follow_snapshot()
+          '''
+          frame_new='''def _draw_frame_with_popup_dismiss():
+              global _preflight_visible
+              _inject_internal_popup_outside_click()
+              _apply_theme_follow_snapshot()
+              _mirror_quick_shortcut_selection()
+          '''
+          if frame_new not in t:
+              if frame_marker not in t:
+                  raise SystemExit('draw frame marker missing')
+              t=t.replace(frame_marker,frame_new,1)
+
+          compile(t,str(p),'exec')
+          p.write_text(t,encoding='utf-8',newline='\n')
+
+          # Preserve V9/V10 no-activate + first-stroke fix.
+          rt=(work/'desktop/satellite_host_runtime.py').read_text(encoding='utf-8')
+          sec=(work/'desktop/secondary_surface_host_runtime.py').read_text(encoding='utf-8')
+          assert 'WS_EX_NOACTIVATE = 0x08000000' in rt
+          assert 'WS_EX_NOACTIVATE = 0x08000000' in sec
+          assert 'SW_SHOWNOACTIVATE' in rt
+          assert '_restore_blender_foreground_if_satellite_activated' in t
+          assert 'for vk in (0x01, 0x02, 0x04):' in t
+          assert '_mirror_quick_shortcut_selection()' in t
+          assert '_runtime.local_sculpt["active_quick_slot"] = int(slot)' in t
+
+          out.unlink(missing_ok=True)
+          with zipfile.ZipFile(out,'w',zipfile.ZIP_DEFLATED,compresslevel=9) as z:
+              for f in sorted(work.rglob('*')):
+                  if f.is_file(): z.write(f,f.relative_to(work).as_posix())
+          h=hashlib.sha256(out.read_bytes()).hexdigest()
+          out.with_suffix(out.suffix+'.sha256.txt').write_text(f'{h}  {out.name}\n',encoding='utf-8')
+          print(h)
+          '@ | Set-Content $py -Encoding UTF8
+          python $py
+      - name: Validate
+        shell: pwsh
+        run: |
+          $v='5.2.2'; $z="$env:RUNNER_TEMP\blender.zip"; $d="$env:RUNNER_TEMP\blender"
+          curl.exe -L --fail "https://download.blender.org/release/Blender5.2/blender-$v-windows-x64.zip" -o $z
+          Expand-Archive $z $d -Force
+          $exe=Get-ChildItem $d -Filter blender.exe -Recurse | Select-Object -First 1
+          & $exe.FullName --command extension validate "$PWD/manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v11.zip"
+          if ($LASTEXITCODE -ne 0) { throw 'validation failed' }
+      - name: Publish
+        shell: pwsh
+        run: |
+          git config user.name 'LumaFold Build Bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v11.zip*
+          git commit -m "candidate: fix Satellite host switch and shortcut visual sync V11"
+          git push origin HEAD:main
