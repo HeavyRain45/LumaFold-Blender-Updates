@@ -1,0 +1,125 @@
+name: Build LumaFold 0.8.49 V18 Ctrl Mask Default
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build-lumafold-0849-v18-ctrl-mask-default.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch V17 fresh-install input profile
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $py = Join-Path $env:RUNNER_TEMP 'v18.py'
+          @'
+          import pathlib, zipfile, shutil, hashlib, os, py_compile
+
+          root = pathlib.Path.cwd()
+          src = root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v17-preview-cache.zip'
+          out = root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v18-ctrl-mask-default.zip'
+          work = pathlib.Path(os.environ['RUNNER_TEMP'])/'lf_v18'
+          shutil.rmtree(work, ignore_errors=True)
+          work.mkdir(parents=True)
+          with zipfile.ZipFile(src) as z:
+              z.extractall(work)
+
+          sculpt = work/'modules/sculpt.py'
+          text = sculpt.read_text(encoding='utf-8').replace('\r\n','\n')
+
+          # Ctrl-on-model Mask is a ZBrush-profile feature. Fresh installs had no
+          # input_profile state key, while the UI fallback was "blender", making
+          # the feature appear missing on clean colleague machines. Give fresh
+          # installs the intended LumaFold/ZBrush profile without overwriting an
+          # existing persisted B/Z choice (StateStore defaults use setdefault).
+          anchor = '        "alpha_slot": 0,\n'
+          addition = '        "input_profile": "zbrush",\n'
+          if addition not in text:
+              if anchor not in text:
+                  raise SystemExit('sculpt defaults anchor missing')
+              text = text.replace(anchor, anchor + addition, 1)
+
+          compile(text, str(sculpt), 'exec')
+          sculpt.write_text(text, encoding='utf-8', newline='\n')
+
+          # Contract gates: the Ctrl mask path itself must remain intact.
+          route = (work/'runtime/sculpt_route_truth.py').read_text(encoding='utf-8')
+          gesture = (work/'runtime/sculpt_mask_gesture.py').read_text(encoding='utf-8')
+          tool = (work/'runtime/sculpt_mask_tool_bridge.py').read_text(encoding='utf-8')
+          init = (work/'__init__.py').read_text(encoding='utf-8')
+          input_profile = (work/'runtime/sculpt_input_profile.py').read_text(encoding='utf-8')
+
+          assert 'if event_type == "LEFTMOUSE" and ctrl and _MASK_GESTURE is not None:' in route
+          assert 'brush_toggle="MASK"' in gesture
+          assert 'def session_begin(' in tool
+          assert 'sculpt_mask_gesture.install' in init
+          assert 'sculpt_route_truth.install' in init
+          assert 'return "zbrush" if value == "zbrush" else "blender"' in input_profile
+          assert '"input_profile": "zbrush"' in text
+
+          # Preserve accepted V17 fixes.
+          sat = (work/'desktop/satellite_host.py').read_text(encoding='utf-8')
+          sat_rt = (work/'desktop/satellite_host_runtime.py').read_text(encoding='utf-8')
+          secondary = (work/'desktop/secondary_surface_host.py').read_text(encoding='utf-8')
+          bridge = (work/'desktop/bridge_server.py').read_text(encoding='utf-8')
+          panels = (work/'panels.py').read_text(encoding='utf-8')
+
+          assert '_restore_blender_foreground_if_satellite_activated()' in sat
+          assert '_mirror_quick_shortcut_selection()' in sat
+          assert 'host_switch_hit_test(x, y)' in sat
+          assert 'if key == "brush_preview_cache":' in sat_rt
+          assert 'sculpt.brush.library_replace_slot' in secondary
+          assert 'def _sculpt_visual_state(self):' in bridge
+          assert 'class LUMAFOLD_Preferences' in panels
+
+          # Whole-package syntax gate.
+          for file in work.rglob('*.py'):
+              py_compile.compile(str(file), doraise=True)
+
+          out.unlink(missing_ok=True)
+          with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+              for f in sorted(work.rglob('*')):
+                  if f.is_file():
+                      z.write(f, f.relative_to(work).as_posix())
+
+          digest = hashlib.sha256(out.read_bytes()).hexdigest()
+          out.with_suffix(out.suffix+'.sha256.txt').write_text(
+              f'{digest}  {out.name}\n', encoding='utf-8'
+          )
+          print('SHA256', digest)
+          '@ | Set-Content $py -Encoding UTF8
+          python $py
+
+      - name: Blender 5.2.0 and 5.2.2 extension validation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pkg = (Resolve-Path "$PWD/manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v18-ctrl-mask-default.zip").Path
+          foreach ($v in @('5.2.0','5.2.2')) {
+            $z = Join-Path $env:RUNNER_TEMP "blender-$v.zip"
+            $d = Join-Path $env:RUNNER_TEMP "blender-$v"
+            curl.exe -L --fail --retry 3 "https://download.blender.org/release/Blender5.2/blender-$v-windows-x64.zip" -o $z
+            if ($LASTEXITCODE -ne 0) { throw "Blender $v download failed" }
+            Expand-Archive $z $d -Force
+            $exe = Get-ChildItem $d -Filter blender.exe -Recurse | Select-Object -First 1
+            if (-not $exe) { throw "Blender $v executable missing" }
+            & $exe.FullName --command extension validate $pkg
+            if ($LASTEXITCODE -ne 0) { throw "Blender $v validation failed" }
+          }
+
+      - name: Publish
+        shell: pwsh
+        run: |
+          git config user.name 'LumaFold Build Bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v18-ctrl-mask-default.zip*
+          git commit -m "candidate: restore fresh-install Ctrl mask profile default"
+          git push origin HEAD:main
