@@ -1,0 +1,217 @@
+name: Build LumaFold 0.8.49 V15
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build-lumafold-0849-v15.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch V14 brush-library Satellite sync
+        shell: pwsh
+        run: |
+          $py = Join-Path $env:RUNNER_TEMP 'v15.py'
+          @'
+          import pathlib, zipfile, shutil, hashlib, os
+
+          root = pathlib.Path.cwd()
+          src = root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v14.zip'
+          out = root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v15.zip'
+          work = pathlib.Path(os.environ['RUNNER_TEMP'])/'lf_v15'
+          shutil.rmtree(work, ignore_errors=True)
+          work.mkdir()
+          with zipfile.ZipFile(src) as z:
+              z.extractall(work)
+
+          # --------------------------------------------------------------
+          # Primary Satellite: keep targeted slot ownership explicit and
+          # reconcile only the tiny cached brush visual state while the
+          # external Brush Library is actually open.
+          # --------------------------------------------------------------
+          host = work/'desktop/satellite_host.py'
+          h = host.read_text(encoding='utf-8').replace('\r\n','\n')
+
+          if '_last_library_visual_sync_at = 0.0' not in h:
+              anchor = 'WM_APP_PRIMARY_BRUSH_VISUAL_SYNC = 0x8053\n'
+              if anchor not in h:
+                  raise SystemExit('V14 visual-sync message anchor missing')
+              h = h.replace(
+                  anchor,
+                  anchor + '_last_library_visual_sync_at = 0.0\n_brush_library_visible_last_frame = False\n',
+                  1,
+              )
+
+          old_open = '''    def _open_product_secondary(kind, anchor=None):
+              return _secondary_session.open_surface(_runtime, kind, anchor)
+          '''
+          new_open = '''    def _open_product_secondary(kind, anchor=None):
+              global _last_target_sent
+              if str(kind or "") == "brush_library":
+                  # The Secondary child keeps the targeted slot until the
+                  # primary explicitly changes/clears it. Force a resend on
+                  # every targeted open, including reopening the same slot.
+                  _last_target_sent = None
+              return _secondary_session.open_surface(_runtime, kind, anchor)
+          '''
+          if old_open in h:
+              h = h.replace(old_open, new_open, 1)
+          elif new_open not in h:
+              raise SystemExit('product secondary open wrapper missing')
+
+          if 'def _sync_brush_visual_state_while_library_open():' not in h:
+              anchor = 'def _draw_frame_with_popup_dismiss():\n'
+              helper = '''def _sync_brush_visual_state_while_library_open():
+              """Lightweight, temporary visual reconcile for the external Brush Library.
+
+              This never calls the full get_state snapshot. It only asks Blender for
+              cached Sculpt brush/quick-slot fields while the Brush Library HWND is
+              visible, plus one final request when it closes.
+              """
+              global _last_library_visual_sync_at, _brush_library_visible_last_frame
+
+              hwnd = _runtime.secondary_hwnd
+              visible = False
+              try:
+                  visible = bool(
+                      hwnd
+                      and _runtime.user32.IsWindow(hwnd)
+                      and _runtime.user32.IsWindowVisible(hwnd)
+                      and str(_runtime.secondary_kind or "") == "brush_library"
+                  )
+              except Exception:
+                  visible = False
+
+              now = _runtime.time.monotonic()
+              should_request = False
+              if visible and now - float(_last_library_visual_sync_at) >= 0.10:
+                  should_request = True
+              elif _brush_library_visible_last_frame and not visible:
+                  # One last reconcile catches a selection immediately followed by
+                  # outside-click dismissal.
+                  should_request = True
+
+              if should_request:
+                  try:
+                      if _runtime.actions.empty():
+                          _runtime.actions.put({"action": "get_sculpt_visual_state"})
+                          _last_library_visual_sync_at = now
+                  except Exception:
+                      pass
+
+              _brush_library_visible_last_frame = bool(visible)
+
+
+          '''
+              if anchor not in h:
+                  raise SystemExit('draw-frame insertion anchor missing')
+              h = h.replace(anchor, helper + anchor, 1)
+
+          draw_start = h.index('def _draw_frame_with_popup_dismiss():')
+          draw_end = h.index('\ndef _network_worker_after_first_render', draw_start)
+          draw_block = h[draw_start:draw_end]
+          if '_sync_brush_visual_state_while_library_open()' not in draw_block:
+              needle = '    _sync_target_slot_to_secondary()\n'
+              if needle not in draw_block:
+                  raise SystemExit('target-slot draw anchor missing')
+              draw_block = draw_block.replace(
+                  needle,
+                  needle + '    _sync_brush_visual_state_while_library_open()\n',
+                  1,
+              )
+              h = h[:draw_start] + draw_block + h[draw_end:]
+
+          compile(h, str(host), 'exec')
+          host.write_text(h, encoding='utf-8', newline='\n')
+
+          # --------------------------------------------------------------
+          # Secondary Brush Library: keep target slot persistent until the
+          # primary explicitly sends another slot or clears it.
+          # --------------------------------------------------------------
+          secondary = work/'desktop/secondary_surface_host_runtime.py'
+          s = secondary.read_text(encoding='utf-8').replace('\r\n','\n')
+
+          old = '''    if slot >= 0:
+                  # Match Embedded targeted replacement semantics.
+                  _queue_command("sculpt.brush.library_assign_slot", identity=identity, slot=slot)
+                  quick_replace_slot = -1
+              _queue_command("sculpt.brush.library_activate", identity=identity)
+          '''
+          new = '''    if slot >= 0:
+                  # Match Embedded targeted replacement semantics. Keep this
+                  # target until Primary explicitly changes/clears it so the
+                  # same Quick Brush tile can be replaced repeatedly.
+                  _queue_command("sculpt.brush.library_assign_slot", identity=identity, slot=slot)
+              _queue_command("sculpt.brush.library_activate", identity=identity)
+          '''
+          if old in s:
+              s = s.replace(old, new, 1)
+          elif new not in s:
+              raise SystemExit('V14 targeted library activation helper missing')
+
+          compile(s, str(secondary), 'exec')
+          secondary.write_text(s, encoding='utf-8', newline='\n')
+
+          # Preserve the accepted V10-V14 behavior.
+          rt = (work/'desktop/satellite_host_runtime.py').read_text(encoding='utf-8')
+          bridge = (work/'desktop/bridge_server.py').read_text(encoding='utf-8')
+          panels = (work/'panels.py').read_text(encoding='utf-8')
+          launcher = (work/'desktop/launcher.py').read_text(encoding='utf-8')
+          manifest = (work/'blender_manifest.toml').read_text(encoding='utf-8')
+
+          assert 'WS_EX_NOACTIVATE = 0x08000000' in rt
+          assert 'SW_SHOWNOACTIVATE' in rt
+          assert '_restore_blender_foreground_if_satellite_activated()' in h
+          assert '_mirror_quick_shortcut_selection()' in h
+          assert 'host_switch_hit_test(x, y)' in h
+          assert 'get_sculpt_visual_state' in h
+          assert 'def _sync_brush_visual_state_while_library_open():' in h
+          assert '_last_target_sent = None' in h
+          assert 'quick_replace_slot = int(wparam) - 1' in s
+          assert 'sculpt.brush.library_assign_slot' in s
+          assert 'quick_replace_slot = -1' not in s[s.index('def _activate_brush_library_product'):s.index('\ndef ', s.index('def _activate_brush_library_product') + 4)]
+          assert 'if action == "get_sculpt_visual_state":' in bridge
+          assert 'class LUMAFOLD_Preferences' in panels
+          assert '_active_slimgui_import_root' in launcher
+          assert 'wheels/slimgui-0.8.2-cp312-abi3-win_amd64.whl' in manifest
+
+          out.unlink(missing_ok=True)
+          with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+              for f in sorted(work.rglob('*')):
+                  if f.is_file():
+                      z.write(f, f.relative_to(work).as_posix())
+
+          digest = hashlib.sha256(out.read_bytes()).hexdigest()
+          out.with_suffix(out.suffix+'.sha256.txt').write_text(
+              f'{digest}  {out.name}\n', encoding='utf-8'
+          )
+          print(digest)
+          '@ | Set-Content $py -Encoding UTF8
+          python $py
+
+      - name: Blender 5.2.2 extension validation
+        shell: pwsh
+        run: |
+          $v='5.2.2'
+          $z="$env:RUNNER_TEMP\blender.zip"
+          $d="$env:RUNNER_TEMP\blender"
+          curl.exe -L --fail "https://download.blender.org/release/Blender5.2/blender-$v-windows-x64.zip" -o $z
+          Expand-Archive $z $d -Force
+          $exe=Get-ChildItem $d -Filter blender.exe -Recurse | Select-Object -First 1
+          & $exe.FullName --command extension validate "$PWD/manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v15.zip"
+          if ($LASTEXITCODE -ne 0) { throw 'validation failed' }
+
+      - name: Publish
+        shell: pwsh
+        run: |
+          git config user.name 'LumaFold Build Bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v15.zip*
+          git commit -m "candidate: keep Satellite quick-slot target and visual cache synced"
+          git push origin HEAD:main
