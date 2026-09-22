@@ -1,0 +1,159 @@
+name: Build LumaFold 0.8.49 Diagnostics Preferences V8
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-lumafold-0849-diagnostics-preferences-v8.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build-test-publish:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout update repository
+        uses: actions/checkout@v4
+
+      - name: Patch V7 with Add-on Preferences diagnostics entry
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $script = Join-Path $env:RUNNER_TEMP 'patch_v8.py'
+          @'
+          import hashlib
+          import pathlib
+          import shutil
+          import zipfile
+
+          root = pathlib.Path.cwd()
+          source = root / "manual" / "candidates" / "lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v7.zip"
+          output = root / "manual" / "candidates" / "lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v8.zip"
+          sha_file = output.with_suffix(output.suffix + ".sha256.txt")
+          work = pathlib.Path(__import__("os").environ["RUNNER_TEMP"]) / "lumafold_v8_stage"
+
+          if not source.is_file():
+              raise SystemExit(f"source candidate missing: {source}")
+          shutil.rmtree(work, ignore_errors=True)
+          work.mkdir(parents=True)
+          with zipfile.ZipFile(source, "r") as zf:
+              zf.extractall(work)
+
+          panels = work / "panels.py"
+          text = panels.read_text(encoding="utf-8").replace("\r\n", "\n")
+
+          marker = "\n\ndef _draw_lumafold_header(self, context):\n"
+          prefs = '''
+
+          class LUMAFOLD_Preferences(bpy.types.AddonPreferences):
+              """Low-frequency maintenance entry shown in Blender Add-on Preferences."""
+
+              bl_idname = __package__
+
+              def draw(self, context):
+                  layout = self.layout
+                  box = layout.box()
+                  box.label(text="LumaFold 维护 / 诊断", icon='TOOL_SETTINGS')
+
+                  visible = bool(real_machine_trace.panel_visible())
+                  row = box.row(align=True)
+                  row.operator(
+                      "lumafold.toggle_real_machine_trace_panel",
+                      text="隐藏诊断 N 菜单" if visible else "显示诊断 N 菜单",
+                      icon='HIDE_ON' if visible else 'HIDE_OFF',
+                  )
+
+                  row = box.row(align=True)
+                  row.operator(
+                      "lumafold.copy_real_machine_trace",
+                      text="复制实机追踪",
+                      icon='COPYDOWN',
+                  )
+                  row.operator(
+                      "lumafold.clear_real_machine_trace",
+                      text="清空追踪",
+                      icon='TRASH',
+                  )
+
+                  box.label(text="诊断面板默认隐藏；需要排查时可从这里随时开启。", icon='INFO')
+          '''
+
+          if "class LUMAFOLD_Preferences" not in text:
+              if marker not in text:
+                  raise SystemExit("panels insertion marker missing")
+              text = text.replace(marker, prefs + marker, 1)
+
+          old_classes = "CLASSES = (LUMAFOLD_MT_product_maintenance,)\n"
+          new_classes = "CLASSES = (LUMAFOLD_MT_product_maintenance, LUMAFOLD_Preferences)\n"
+          if old_classes not in text and new_classes not in text:
+              raise SystemExit("panels CLASSES marker missing")
+          text = text.replace(old_classes, new_classes, 1)
+
+          # Preserve the already accepted top-right contract: one LumaFold button,
+          # no maintenance dropdown in the View3D header.
+          header_start = text.index("def _draw_lumafold_header")
+          header_end = text.index("\ndef _tag_view3d_headers_redraw", header_start)
+          header = text[header_start:header_end]
+          if 'row.menu("LUMAFOLD_MT_product_maintenance"' in header:
+              raise SystemExit("top-right maintenance dropdown regressed")
+
+          compile(text, str(panels), "exec")
+          panels.write_text(text, encoding="utf-8", newline="\n")
+
+          # Preserve V7 behavior and self-contained runtime.
+          bridge = (work / "desktop" / "bridge_server.py").read_text(encoding="utf-8")
+          if 'satellite_client and command_id in {"sculpt.enter", "sculpt.exit_to_object"}' not in bridge:
+              raise SystemExit("V7 mode-sync transport lost")
+          satellite = (work / "desktop" / "satellite_host.py").read_text(encoding="utf-8")
+          if "awaiting_grant = False" not in satellite:
+              raise SystemExit("Satellite handoff fix lost")
+          launcher = (work / "desktop" / "launcher.py").read_text(encoding="utf-8")
+          if "_active_slimgui_import_root" not in launcher:
+              raise SystemExit("bundled runtime launch fix lost")
+          manifest = (work / "blender_manifest.toml").read_text(encoding="utf-8")
+          if 'wheels/slimgui-0.8.2-cp312-abi3-win_amd64.whl' not in manifest:
+              raise SystemExit("bundled slimgui manifest entry lost")
+          if not (work / "wheels" / "slimgui-0.8.2-cp312-abi3-win_amd64.whl").is_file():
+              raise SystemExit("bundled slimgui wheel lost")
+
+          output.unlink(missing_ok=True)
+          with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+              for item in sorted(work.rglob("*")):
+                  if item.is_file():
+                      zf.write(item, item.relative_to(work).as_posix())
+
+          digest = hashlib.sha256(output.read_bytes()).hexdigest()
+          sha_file.write_text(f"{digest}  {output.name}\n", encoding="utf-8")
+          print(f"Built {output} ({output.stat().st_size} bytes)")
+          print(f"SHA256 {digest}")
+          '@ | Set-Content -Path $script -Encoding UTF8
+          python $script
+
+      - name: Blender 5.2.2 extension validation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $package = (Resolve-Path "$PWD/manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v8.zip").Path
+          $version = '5.2.2'
+          $archive = Join-Path $env:RUNNER_TEMP "blender-$version-windows-x64.zip"
+          $blenderRoot = Join-Path $env:RUNNER_TEMP "blender-$version"
+          curl.exe -L --fail --retry 3 --retry-delay 2 "https://download.blender.org/release/Blender5.2/blender-$version-windows-x64.zip" -o $archive
+          if ($LASTEXITCODE -ne 0) { throw "Blender download failed" }
+          Expand-Archive -Path $archive -DestinationPath $blenderRoot -Force
+          $exe = Get-ChildItem -Path $blenderRoot -Filter blender.exe -Recurse | Select-Object -First 1
+          if (-not $exe) { throw "Blender executable not found" }
+          & $exe.FullName --command extension validate $package
+          if ($LASTEXITCODE -ne 0) { throw "extension validation failed" }
+
+      - name: Publish verified V8 candidate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config user.name 'LumaFold Build Bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v8.zip
+          git add manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v8.zip.sha256.txt
+          git commit -m "candidate: add diagnostics controls to Add-on Preferences"
+          git push origin HEAD:main
