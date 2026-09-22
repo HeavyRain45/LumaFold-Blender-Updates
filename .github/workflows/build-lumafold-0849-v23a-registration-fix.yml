@@ -1,0 +1,123 @@
+name: Build LumaFold 0.8.49 V23a Registration Fix
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build-lumafold-0849-v23a-registration-fix.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fix V23 mask operator registration
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $py = Join-Path $env:RUNNER_TEMP 'v23a.py'
+          @'
+          import pathlib, zipfile, shutil, hashlib, os
+
+          root = pathlib.Path.cwd()
+          src = root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v23-mask-tap-satellite-hitguard.zip'
+          out = root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v23a-mask-tap-satellite-hitguard.zip'
+          work = pathlib.Path(os.environ['RUNNER_TEMP'])/'lf_v23a'
+          shutil.rmtree(work, ignore_errors=True)
+          work.mkdir(parents=True)
+          with zipfile.ZipFile(src) as z:
+              z.extractall(work)
+
+          gesture = work/'runtime/sculpt_mask_gesture.py'
+          g = gesture.read_text(encoding='utf-8').replace('\r\n','\n')
+
+          # V23 replaced the class modal block up to handle_pointer_press and
+          # accidentally deleted the module-level registration tuple that sits
+          # between them in the stable source.
+          if '_CLASSES = (LUMAFOLD_OT_sculpt_mask_gesture_v2,)' not in g:
+              anchor = '\ndef handle_pointer_press(context, event, target):\n'
+              if anchor not in g:
+                  raise SystemExit('handle_pointer_press anchor missing')
+              g = g.replace(
+                  anchor,
+                  '\n_CLASSES = (LUMAFOLD_OT_sculpt_mask_gesture_v2,)\n\n' + anchor,
+                  1,
+              )
+
+          # Contract checks.
+          assert '_CLASSES = (LUMAFOLD_OT_sculpt_mask_gesture_v2,)' in g
+          assert 'for cls in _CLASSES:' in g
+          assert 'for cls in reversed(_CLASSES):' in g
+          assert 'mask_feather_tap' in g
+          assert 'mask_sharpen_tap' in g
+          assert 'background_invert_tap' in g
+          assert 'surface_mask_drag_handoff' in g
+          assert 'background_native_mask_handoff' in g
+
+          compile(g, str(gesture), 'exec')
+          gesture.write_text(g, encoding='utf-8', newline='\n')
+
+          # Preserve V23 Satellite hit guard and accepted prior fixes.
+          route = (work/'runtime/sculpt_route_truth.py').read_text(encoding='utf-8')
+          sat = (work/'desktop/satellite_host.py').read_text(encoding='utf-8')
+          sat_rt = (work/'desktop/satellite_host_runtime.py').read_text(encoding='utf-8')
+          secondary = (work/'desktop/secondary_surface_host.py').read_text(encoding='utf-8')
+          bridge = (work/'desktop/bridge_server.py').read_text(encoding='utf-8')
+
+          assert 'satellite_pointer_guard' in route
+          assert 'WindowFromPoint' in route
+          assert 'satellite_client_pointer_reprime' in sat
+          assert '_restore_blender_foreground_if_satellite_activated()' in sat
+          assert '_mirror_quick_shortcut_selection()' in sat
+          assert 'host_switch_hit_test(x, y)' in sat
+          assert 'if key == "brush_preview_cache":' in sat_rt
+          assert 'sculpt.brush.library_replace_slot' in secondary
+          assert 'def _sculpt_visual_state(self):' in bridge
+
+          # Whole package syntax gate.
+          for f in work.rglob('*.py'):
+              compile(f.read_text(encoding='utf-8'), str(f), 'exec')
+
+          out.unlink(missing_ok=True)
+          with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+              for f in sorted(work.rglob('*')):
+                  if f.is_file():
+                      z.write(f, f.relative_to(work).as_posix())
+
+          digest = hashlib.sha256(out.read_bytes()).hexdigest()
+          out.with_suffix(out.suffix+'.sha256.txt').write_text(
+              f'{digest}  {out.name}\n', encoding='utf-8'
+          )
+          print('SHA256', digest)
+          '@ | Set-Content $py -Encoding UTF8
+          python $py
+
+      - name: Blender 5.2.0 and 5.2.2 extension validation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pkg = (Resolve-Path "$PWD/manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v23a-mask-tap-satellite-hitguard.zip").Path
+          foreach ($v in @('5.2.0','5.2.2')) {
+            $z = Join-Path $env:RUNNER_TEMP "blender-$v.zip"
+            $d = Join-Path $env:RUNNER_TEMP "blender-$v"
+            curl.exe -L --fail --retry 3 "https://download.blender.org/release/Blender5.2/blender-$v-windows-x64.zip" -o $z
+            if ($LASTEXITCODE -ne 0) { throw "Blender $v download failed" }
+            Expand-Archive $z $d -Force
+            $exe = Get-ChildItem $d -Filter blender.exe -Recurse | Select-Object -First 1
+            if (-not $exe) { throw "Blender $v executable missing" }
+            & $exe.FullName --command extension validate $pkg
+            if ($LASTEXITCODE -ne 0) { throw "Blender $v validation failed" }
+          }
+
+      - name: Publish
+        shell: pwsh
+        run: |
+          git config user.name 'LumaFold Build Bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v23a-mask-tap-satellite-hitguard.zip*
+          git commit -m "candidate: restore V23 mask operator registration tuple"
+          git push origin HEAD:main
