@@ -39,23 +39,20 @@ jobs:
           view = work/'ui/sculpt_view.py'
           v = view.read_text(encoding='utf-8').replace('\r\n','\n')
 
-          tooltip_block = '''    try:
-              if imgui.is_item_hovered():
-                  if empty:
-                      tip = "添加当前快捷笔刷"
-                  else:
-                      tip = str(label or "快捷笔刷")
-                      if shortcut:
-                          tip += " · " + shortcut
-                      tip += "\n图标：打开笔刷库替换槽位 · 名称：切换笔刷 · 右键：槽位菜单"
-                  imgui.set_tooltip(tip)
-          except Exception:
-              pass
-          '''
-          if tooltip_block in v:
-              v = v.replace(tooltip_block, '', 1)
-          elif '图标：打开笔刷库替换槽位' in v:
-              raise SystemExit('Quick Brush visual tooltip block shape changed')
+          visual_start = v.index('def _visual_quick_slot_widget(')
+          visual_end = v.index('\n\ndef _prepare_visual_caches', visual_start)
+          visual = v[visual_start:visual_end]
+          tip_marker = 'tip += "\\n图标：打开笔刷库替换槽位 · 名称：切换笔刷 · 右键：槽位菜单"'
+          if tip_marker in visual:
+              tip_pos = visual.index(tip_marker)
+              try_start = visual.rfind('    try:\n', 0, tip_pos)
+              try_end = visual.index('    return bool(clicked)', tip_pos)
+              if try_start < 0 or try_end < 0:
+                  raise SystemExit('Quick Brush tooltip boundaries missing')
+              visual = visual[:try_start] + visual[try_end:]
+              v = v[:visual_start] + visual + v[visual_end:]
+          elif '图标：打开笔刷库替换槽位' in visual:
+              raise SystemExit('Quick Brush visual tooltip marker shape changed')
 
           # --------------------------------------------------------------
           # 2) Preview/icon click = switch to that Quick Brush AND open library.
