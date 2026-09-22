@@ -1,0 +1,214 @@
+name: Build LumaFold 0.8.49 V30 Satellite Quick Rows Resize
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build-lumafold-0849-v30-satellite-quick-rows-resize.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch V29
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $py = Join-Path $env:RUNNER_TEMP 'v30.py'
+          @'
+          import pathlib, zipfile, shutil, hashlib, os
+
+          root = pathlib.Path.cwd()
+          src = root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v29-quickbrush-open-anchor.zip'
+          out = root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v30-satellite-quick-rows-resize.zip'
+          work = pathlib.Path(os.environ['RUNNER_TEMP'])/'lf_v30'
+          shutil.rmtree(work, ignore_errors=True)
+          work.mkdir(parents=True)
+          with zipfile.ZipFile(src) as z:
+              z.extractall(work)
+
+          # ==============================================================
+          # Root cause
+          #
+          # V29 correctly stopped the bottom Brush Library button from
+          # overwriting a targeted Quick Brush popup anchor. However,
+          # Satellite primary-window preflight had also (incorrectly) reused
+          # that popup anchor as its bottom geometry measurement.
+          #
+          # Split the two responsibilities:
+          #   sculpt_brush_library_anchor -> popup placement only
+          #   sculpt_primary_bottom_anchor -> always-published layout metric
+          #
+          # Satellite geometry now reads only the dedicated layout metric.
+          # ==============================================================
+
+          foundation = work/'ui/sculpt_view_foundation.py'
+          f = foundation.read_text(encoding='utf-8').replace('\r\n','\n')
+
+          old = '''    brush_library_clicked = button(imgui, "笔刷库", scale, bottom_w / scale)
+              brush_anchor = _item_anchor(imgui, scale)
+              if brush_library_clicked:
+                  # The bottom button owns the anchor only when it is the actual
+                  # opener. Do not overwrite a Quick Brush targeted-open anchor
+                  # later in the same frame.
+                  surface_state["sculpt_brush_library_anchor"] = dict(brush_anchor)
+          '''
+          new = '''    brush_library_clicked = button(imgui, "笔刷库", scale, bottom_w / scale)
+              brush_anchor = _item_anchor(imgui, scale)
+              # Layout geometry and popup placement are separate contracts.
+              # This metric is always published so Satellite can size its native
+              # Host from the actual final control of the shared Primary View.
+              surface_state["sculpt_primary_bottom_anchor"] = dict(brush_anchor)
+              if brush_library_clicked:
+                  # Popup placement changes only when this button is the opener.
+                  # Targeted Quick Brush opens keep their tile anchor from V29.
+                  surface_state["sculpt_brush_library_anchor"] = dict(brush_anchor)
+          '''
+          if old not in f:
+              raise SystemExit('V29 foundation brush anchor block not found')
+          f = f.replace(old, new, 1)
+          compile(f, str(foundation), 'exec')
+          foundation.write_text(f, encoding='utf-8', newline='\n')
+
+          runtime = work/'desktop/satellite_host_runtime.py'
+          r = runtime.read_text(encoding='utf-8').replace('\r\n','\n')
+
+          old_metric = '        anchor = dict(surface_state.get("sculpt_brush_library_anchor") or {})\n'
+          new_metric = '        anchor = dict(surface_state.get("sculpt_primary_bottom_anchor") or {})\n'
+          # Change only the Primary preflight measurement, not Secondary popup geometry.
+          cal_start = r.index('def _calibrate_primary_surface_from_view(rows):')
+          cal_end = r.index('\n\ndef _apply_primary_surface_contract', cal_start)
+          cal = r[cal_start:cal_end]
+          if old_metric not in cal:
+              raise SystemExit('Satellite primary calibration anchor not found')
+          cal = cal.replace(old_metric, new_metric, 1)
+          r = r[:cal_start] + cal + r[cal_end:]
+
+          # Make the row-change contract self-healing if a visible Satellite
+          # somehow reaches this path before preflight geometry is ready. The
+          # next draw publishes the dedicated bottom metric, calibrates, then
+          # applies the pending resize instead of losing the user's row request.
+          commit_start = r.index('def _commit_pending_primary_surface():')
+          commit_end = r.index('\n\ndef _queue_state_change', commit_start)
+          commit = r[commit_start:commit_end]
+          old_tail = '''    if _primary_geometry_ready and _primary_resize_pending:
+                  _apply_primary_surface_contract(rows)
+          '''
+          new_tail = '''    if _primary_resize_pending:
+                  if not _primary_geometry_ready:
+                      _calibrate_primary_surface_from_view(rows)
+                  if _primary_geometry_ready:
+                      _apply_primary_surface_contract(rows)
+          '''
+          if old_tail not in commit:
+              raise SystemExit('Satellite pending resize tail not found')
+          commit = commit.replace(old_tail, new_tail, 1)
+          r = r[:commit_start] + commit + r[commit_end:]
+
+          compile(r, str(runtime), 'exec')
+          runtime.write_text(r, encoding='utf-8', newline='\n')
+
+          # ==============================================================
+          # Regression gates
+          # ==============================================================
+          view = (work/'ui/sculpt_view.py').read_text(encoding='utf-8')
+          session = (work/'desktop/secondary_surface_session.py').read_text(encoding='utf-8')
+          secondary = (work/'desktop/secondary_surface_host.py').read_text(encoding='utf-8')
+          nav = (work/'runtime/sculpt_navigation.py').read_text(encoding='utf-8')
+          pointer = (work/'runtime/sculpt_native_pointer.py').read_text(encoding='utf-8')
+          mask = (work/'runtime/sculpt_mask_gesture.py').read_text(encoding='utf-8')
+          route = (work/'runtime/sculpt_route_truth.py').read_text(encoding='utf-8')
+          sat = (work/'desktop/satellite_host.py').read_text(encoding='utf-8')
+
+          # V30 geometry separation.
+          assert 'surface_state["sculpt_primary_bottom_anchor"] = dict(brush_anchor)' in f
+          assert 'surface_state.get("sculpt_primary_bottom_anchor")' in cal
+          assert 'surface_state.get("sculpt_brush_library_anchor")' not in cal
+          assert 'if not _primary_geometry_ready:' in commit
+          assert '_calibrate_primary_surface_from_view(rows)' in commit
+          assert '_apply_primary_surface_contract(rows)' in commit
+          assert 'set_exact_client_size(hwnd_main, target_w, target_h)' in r
+          assert '_apply_rounded_window_region(hwnd_main)' in r
+          assert 'on_set_quick_rows=_queue_quick_rows' in r
+
+          # V29 popup-anchor behavior is frozen.
+          block_start = f.index('brush_library_clicked = button(imgui, "笔刷库"')
+          block_end = f.index('imgui.same_line(spacing=bottom_gap)', block_start)
+          anchor_block = f[block_start:block_end]
+          assert anchor_block.index('if brush_library_clicked:') < anchor_block.index('surface_state["sculpt_brush_library_anchor"]')
+          assert 'def _toggle_secondary_surface(kind="brush_library", anchor=None, *, open_only=False):' in r
+          assert '_toggle_secondary_surface(kind, anchor, open_only=True)' in r
+          assert 'runtime._toggle_secondary_surface(kind, anchor, open_only=True)' in session
+
+          # V27 first-click targeted open remains.
+          assert 'pressed_preview = False' in view
+          assert 'imgui_arg.is_mouse_clicked(0)' in view
+          assert '_open_targeted_library(int(ident)' in view
+
+          # V28 native Shift snap path is frozen.
+          assert 'def invoke_blender_rotate(target) -> bool:' in nav
+          assert 'AXIS_SNAP_ENABLE' in nav and 'AXIS_SNAP_DISABLE' in nav
+          assert 'LEFT_SHIFT' in nav and 'RIGHT_SHIFT' in nav
+          assert 'getattr(navigation, "invoke_blender_rotate", None)' in pointer
+          assert 'bpy.ops.view3d.rotate("INVOKE_DEFAULT")' not in pointer
+
+          # Preserve preview / Mask / Satellite first-stroke chain.
+          assert 'on_request_preview=_request_brush_previews_exact' in secondary
+          assert '_BRUSH_PREVIEW_QUEUE_LIMIT = 4' in secondary
+          assert 'clean_age >= 0.18' in secondary
+          assert '_CLASSES = (LUMAFOLD_OT_sculpt_mask_gesture_v2,)' in mask
+          assert 'mask_feather_tap' in mask
+          assert 'mask_sharpen_tap' in mask
+          assert 'background_invert_tap' in mask
+          assert 'satellite_pointer_guard' in route
+          assert 'satellite_client_pointer_reprime' in sat
+          assert '_restore_blender_foreground_if_satellite_activated()' in sat
+          assert '_mirror_quick_shortcut_selection()' in sat
+
+          for py in work.rglob('*.py'):
+              compile(py.read_text(encoding='utf-8'), str(py), 'exec')
+
+          out.unlink(missing_ok=True)
+          with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+              for file in sorted(work.rglob('*')):
+                  if file.is_file():
+                      z.write(file, file.relative_to(work).as_posix())
+
+          digest = hashlib.sha256(out.read_bytes()).hexdigest()
+          out.with_suffix(out.suffix+'.sha256.txt').write_text(
+              f'{digest}  {out.name}\n', encoding='utf-8'
+          )
+          print('SHA256', digest)
+          '@ | Set-Content $py -Encoding UTF8
+          python $py
+
+      - name: Blender 5.2.0 and 5.2.2 extension validation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pkg = (Resolve-Path "$PWD/manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v30-satellite-quick-rows-resize.zip").Path
+          foreach ($v in @('5.2.0','5.2.2')) {
+            $z = Join-Path $env:RUNNER_TEMP "blender-$v.zip"
+            $d = Join-Path $env:RUNNER_TEMP "blender-$v"
+            curl.exe -L --fail --retry 3 "https://download.blender.org/release/Blender5.2/blender-$v-windows-x64.zip" -o $z
+            if ($LASTEXITCODE -ne 0) { throw "Blender $v download failed" }
+            Expand-Archive $z $d -Force
+            $exe = Get-ChildItem $d -Filter blender.exe -Recurse | Select-Object -First 1
+            if (-not $exe) { throw "Blender $v executable missing" }
+            & $exe.FullName --command extension validate $pkg
+            if ($LASTEXITCODE -ne 0) { throw "Blender $v validation failed" }
+          }
+
+      - name: Publish
+        shell: pwsh
+        run: |
+          git config user.name 'LumaFold Build Bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v30-satellite-quick-rows-resize.zip*
+          git commit -m "candidate: restore Satellite quick-row geometry contract"
+          git push origin HEAD:main
