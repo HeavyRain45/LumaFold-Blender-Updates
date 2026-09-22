@@ -1,0 +1,191 @@
+name: Build LumaFold 0.8.49 V17 Preview Cache
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build-lumafold-0849-v17-preview-cache.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch V16 Clean preview-cache semantics
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $py = Join-Path $env:RUNNER_TEMP 'v17.py'
+          @'
+          import pathlib, zipfile, shutil, hashlib, os
+
+          root = pathlib.Path.cwd()
+          src = root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v16-clean.zip'
+          out = root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v17-preview-cache.zip'
+          work = pathlib.Path(os.environ['RUNNER_TEMP'])/'lf_v17'
+          shutil.rmtree(work, ignore_errors=True)
+          work.mkdir(parents=True)
+          with zipfile.ZipFile(src) as z:
+              z.extractall(work)
+
+          # --------------------------------------------------------------
+          # 1) Satellite local preview cache is cumulative residency, not a
+          # replaceable snapshot field. Merge incoming deltas instead of
+          # erasing previews already received during preflight.
+          # --------------------------------------------------------------
+          runtime = work/'desktop/satellite_host_runtime.py'
+          r = runtime.read_text(encoding='utf-8').replace('\r\n','\n')
+
+          loop = '''    for key in (
+              "quick_slot", "quick_brush_slots", "active_quick_slot",
+              "current_brush_name", "current_brush_asset", "current_brush_type",
+              "current_brush_preview", "brush_preview_cache", "brush_sync_status", "brush_action_status",
+              "brush_size", "brush_strength",
+              "current_alpha_name", "current_alpha_identity", "current_alpha_filepath",
+              "current_alpha_map_mode", "current_alpha_preview", "alpha_sync_status",
+          ):
+              if now >= float(local_override_until.get(key, 0.0)) and key in remote:
+                  local_sculpt[key] = remote[key]
+          '''
+          replacement = '''    for key in (
+              "quick_slot", "quick_brush_slots", "active_quick_slot",
+              "current_brush_name", "current_brush_asset", "current_brush_type",
+              "current_brush_preview", "brush_preview_cache", "brush_sync_status", "brush_action_status",
+              "brush_size", "brush_strength",
+              "current_alpha_name", "current_alpha_identity", "current_alpha_filepath",
+              "current_alpha_map_mode", "current_alpha_preview", "alpha_sync_status",
+          ):
+              if now >= float(local_override_until.get(key, 0.0)) and key in remote:
+                  if key == "brush_preview_cache":
+                      # Preview payloads are immutable by asset identity. A
+                      # lightweight response may contain only a subset, so merge
+                      # it into the resident Satellite cache instead of treating
+                      # that subset as the entire truth and blanking other tiles.
+                      merged = dict(local_sculpt.get("brush_preview_cache") or {})
+                      for identity, raw in dict(remote.get("brush_preview_cache") or {}).items():
+                          payload = dict(raw or {})
+                          if payload.get("rgba_b64"):
+                              payload["key"] = str(identity)
+                              merged[str(identity)] = payload
+                      while len(merged) > 48:
+                          merged.pop(next(iter(merged)), None)
+                      local_sculpt["brush_preview_cache"] = merged
+                  else:
+                      local_sculpt[key] = remote[key]
+          '''
+          if loop not in r:
+              raise SystemExit('Satellite local-sync loop not found')
+          r = r.replace(loop, replacement, 1)
+          compile(r, str(runtime), 'exec')
+          runtime.write_text(r, encoding='utf-8', newline='\n')
+
+          # --------------------------------------------------------------
+          # 2) V16's lightweight visual response bypassed the existing
+          # primary_visual_assets Satellite filter. Recreate the same compact
+          # <=16 Quick Brush cache from the warm primary cache + legacy cache.
+          # --------------------------------------------------------------
+          bridge = work/'desktop/bridge_server.py'
+          b = bridge.read_text(encoding='utf-8').replace('\r\n','\n')
+
+          fn_start = b.index('    def _sculpt_visual_state(self):')
+          fn_end = b.index('\n\n    def _process(', fn_start)
+          fn = b[fn_start:fn_end]
+
+          old = '        visual = {key: sculpt_state.get(key) for key in keys if key in sculpt_state}\n'
+          new = '''        visual = {key: sculpt_state.get(key) for key in keys if key in sculpt_state}
+
+              # Quick Brush previews are accumulated by primary_visual_assets in
+              # primary_brush_preview_cache. The legacy brush_preview_cache only
+              # receives the brushes that have actually become current. Build one
+              # compact complete cache for the visible Quick Brush slots from both.
+              primary_cache = dict(sculpt_state.get("primary_brush_preview_cache") or {})
+              legacy_cache = dict(sculpt_state.get("brush_preview_cache") or {})
+              slots = list(sculpt_state.get("quick_brush_slots") or ())
+              try:
+                  rows = max(2, min(4, int(sculpt_state.get("quick_rows", 2) or 2)))
+              except Exception:
+                  rows = 2
+
+              compact = {}
+              for slot in slots[: rows * 4]:
+                  slot = dict(slot or {})
+                  rel = str(slot.get("relative_asset_identifier") or "").replace("\\\\", "/").strip()
+                  if not rel:
+                      continue
+                  identity = "asset|{}|{}|{}".format(
+                      str(slot.get("asset_library_type") or "").casefold(),
+                      str(slot.get("asset_library_identifier") or "").casefold(),
+                      rel.casefold(),
+                  )
+                  payload = dict(primary_cache.get(identity) or legacy_cache.get(identity) or {})
+                  if payload.get("rgba_b64"):
+                      payload["key"] = identity
+                      compact[identity] = payload
+              visual["brush_preview_cache"] = compact
+          '''
+          if old not in fn:
+              raise SystemExit('V16 visual-state cache assignment not found')
+          fn = fn.replace(old, new, 1)
+          b = b[:fn_start] + fn + b[fn_end:]
+          compile(b, str(bridge), 'exec')
+          bridge.write_text(b, encoding='utf-8', newline='\n')
+
+          # Gates: this must stay event-driven and preserve previous fixes.
+          host = (work/'desktop/satellite_host.py').read_text(encoding='utf-8')
+          secondary = (work/'desktop/secondary_surface_host.py').read_text(encoding='utf-8')
+          panels = (work/'panels.py').read_text(encoding='utf-8')
+          launcher = (work/'desktop/launcher.py').read_text(encoding='utf-8')
+          manifest = (work/'blender_manifest.toml').read_text(encoding='utf-8')
+
+          assert 'if key == "brush_preview_cache":' in r
+          assert 'merged = dict(local_sculpt.get("brush_preview_cache") or {})' in r
+          assert 'primary_cache = dict(sculpt_state.get("primary_brush_preview_cache") or {})' in b
+          assert 'visual["brush_preview_cache"] = compact' in b
+          assert '_restore_blender_foreground_if_satellite_activated()' in host
+          assert '_mirror_quick_shortcut_selection()' in host
+          assert 'host_switch_hit_test(x, y)' in host
+          assert 'sculpt.brush.library_replace_slot' in secondary
+          worker = secondary[secondary.index('def _network_worker_watchdog'):secondary.index('_runtime._network_worker = _network_worker_watchdog')]
+          assert 'payload = {"action": "get_state"}' not in worker
+          assert 'class LUMAFOLD_Preferences' in panels
+          assert '_active_slimgui_import_root' in launcher
+          assert 'wheels/slimgui-0.8.2-cp312-abi3-win_amd64.whl' in manifest
+
+          out.unlink(missing_ok=True)
+          with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+              for f in sorted(work.rglob('*')):
+                  if f.is_file():
+                      z.write(f, f.relative_to(work).as_posix())
+
+          digest = hashlib.sha256(out.read_bytes()).hexdigest()
+          out.with_suffix(out.suffix+'.sha256.txt').write_text(
+              f'{digest}  {out.name}\n', encoding='utf-8'
+          )
+          print(digest)
+          '@ | Set-Content $py -Encoding UTF8
+          python $py
+
+      - name: Blender 5.2.2 extension validation
+        shell: pwsh
+        run: |
+          $v='5.2.2'
+          $z="$env:RUNNER_TEMP\blender.zip"
+          $d="$env:RUNNER_TEMP\blender"
+          curl.exe -L --fail "https://download.blender.org/release/Blender5.2/blender-$v-windows-x64.zip" -o $z
+          Expand-Archive $z $d -Force
+          $exe=Get-ChildItem $d -Filter blender.exe -Recurse | Select-Object -First 1
+          & $exe.FullName --command extension validate "$PWD/manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v17-preview-cache.zip"
+          if ($LASTEXITCODE -ne 0) { throw 'validation failed' }
+
+      - name: Publish
+        shell: pwsh
+        run: |
+          git config user.name 'LumaFold Build Bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v17-preview-cache.zip*
+          git commit -m "candidate: preserve full Satellite Quick Brush preview residency"
+          git push origin HEAD:main
