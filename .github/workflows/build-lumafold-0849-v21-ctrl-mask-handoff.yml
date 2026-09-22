@@ -1,0 +1,281 @@
+name: Build LumaFold 0.8.49 V21 Ctrl Mask Handoff
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build-lumafold-0849-v21-ctrl-mask-handoff.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch V17 with native brush-tool handoff
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $py = Join-Path $env:RUNNER_TEMP 'v21.py'
+          @'
+          import pathlib, zipfile, shutil, hashlib, os
+
+          root = pathlib.Path.cwd()
+          src = root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v17-preview-cache.zip'
+          out = root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v21-ctrl-mask-handoff.zip'
+          work = pathlib.Path(os.environ['RUNNER_TEMP'])/'lf_v21'
+          shutil.rmtree(work, ignore_errors=True)
+          work.mkdir(parents=True)
+          with zipfile.ZipFile(src) as z:
+              z.extractall(work)
+
+          # Fresh installs use LumaFold/Z input semantics, but persisted B/Z choice
+          # remains authoritative because StateStore defaults are setdefault-based.
+          sculpt = work/'modules/sculpt.py'
+          m = sculpt.read_text(encoding='utf-8').replace('\r\n','\n')
+          anchor = '        "alpha_slot": 0,\n'
+          default_line = '        "input_profile": "zbrush",\n'
+          if default_line not in m:
+              if anchor not in m:
+                  raise SystemExit('sculpt defaults anchor missing')
+              m = m.replace(anchor, anchor + default_line, 1)
+          compile(m, str(sculpt), 'exec')
+          sculpt.write_text(m, encoding='utf-8', newline='\n')
+
+          # --------------------------------------------------------------
+          # Blender 5.2 source truth:
+          # SCULPT_OT_brush_stroke polls paint_brush_tool_poll(), which rejects
+          # non-brush WorkSpaceTools. Therefore a Box/Lasso/Line Mask tool cannot
+          # stay the actual active tool at the exact instant brush_stroke is invoked.
+          #
+          # Solution:
+          #   Ctrl idle         -> native Mask gesture tool remains highlighted.
+          #   Ctrl + surface    -> synchronously switch to the saved brush tool,
+          #                        invoke native brush_stroke(MASK), immediately
+          #                        restore Mask tool after the modal is created.
+          #   Blender PASS_THROUGH -> restore Mask tool, invoke remembered native
+          #                            gesture tool for background.
+          #
+          # No custom ray-cast decides surface/background.
+          # --------------------------------------------------------------
+          tool = work/'runtime/sculpt_mask_tool_bridge.py'
+          t = tool.read_text(encoding='utf-8').replace('\r\n','\n')
+
+          if 'def surface_brush_handoff_begin(' not in t:
+              insert_at = t.index('def gesture_begin(context=None) -> dict:')
+              helper = (
+                  'def surface_brush_handoff_begin(context=None) -> bool:\n'
+                  '    """Temporarily expose the saved brush WorkSpaceTool for SCULPT_OT_brush_stroke poll."""\n'
+                  '    workspace = _workspace(context)\n'
+                  '    if workspace is None:\n'
+                  '        return False\n'
+                  '    state = _state(workspace)\n'
+                  '    if not state.get("session_active"):\n'
+                  '        return False\n'
+                  '    restore_tool = str(state.get("restore_tool") or state.get("base_tool") or "")\n'
+                  '    if not restore_tool or restore_tool in MASK_TOOL_IDS:\n'
+                  '        return False\n'
+                  '    active_id = _active_tool_id(workspace)\n'
+                  '    if active_id == restore_tool:\n'
+                  '        return True\n'
+                  '    if _set_tool(context, restore_tool):\n'
+                  '        _trace(\n'
+                  '            "ctrl_mask_surface_brush_handoff_begin",\n'
+                  '            tool=restore_tool,\n'
+                  '            mask_tool=str(state.get("session_tool") or ""),\n'
+                  '        )\n'
+                  '        return True\n'
+                  '    _trace(\n'
+                  '        "ctrl_mask_surface_brush_handoff_failed",\n'
+                  '        tool=restore_tool,\n'
+                  '        mask_tool=str(state.get("session_tool") or ""),\n'
+                  '    )\n'
+                  '    return False\n'
+                  '\n'
+                  '\n'
+                  'def surface_brush_handoff_end(context=None) -> bool:\n'
+                  '    """Restore the temporary native Mask tool while Ctrl still owns the session."""\n'
+                  '    workspace = _workspace(context)\n'
+                  '    if workspace is None:\n'
+                  '        return False\n'
+                  '    state = _state(workspace)\n'
+                  '    if not state.get("session_active") or not bool(state.get("ctrl_held")):\n'
+                  '        return False\n'
+                  '    mask_tool = str(state.get("session_tool") or state.get("selected_mask_tool") or BOX_TOOL_ID)\n'
+                  '    if mask_tool not in MASK_TOOL_IDS:\n'
+                  '        mask_tool = BOX_TOOL_ID\n'
+                  '    if _active_tool_id(workspace) == mask_tool:\n'
+                  '        return True\n'
+                  '    if _set_tool(context, mask_tool):\n'
+                  '        _trace("ctrl_mask_surface_brush_handoff_end", tool=mask_tool)\n'
+                  '        return True\n'
+                  '    _trace("ctrl_mask_surface_brush_restore_failed", tool=mask_tool)\n'
+                  '    return False\n'
+                  '\n'
+                  '\n'
+              )
+              t = t[:insert_at] + helper + t[insert_at:]
+
+          compile(t, str(tool), 'exec')
+          tool.write_text(t, encoding='utf-8', newline='\n')
+
+          gesture = work/'runtime/sculpt_mask_gesture.py'
+          g = gesture.read_text(encoding='utf-8').replace('\r\n','\n')
+
+          start = g.index('def handle_pointer_press(context, event, target):')
+          end = g.index('\ndef install(', start)
+          new_handle = (
+              'def handle_pointer_press(context, event, target):\n'
+              '    if str(getattr(event, "type", "") or "").upper() != "LEFTMOUSE":\n'
+              '        return None\n'
+              '    if str(getattr(event, "value", "") or "").upper() != "PRESS":\n'
+              '        return None\n'
+              '    if not bool(getattr(event, "ctrl", False)) or bool(getattr(event, "shift", False)):\n'
+              '        return None\n'
+              '    if target is None:\n'
+              '        return False\n'
+              '\n'
+              '    begin = getattr(_TOOL_BRIDGE, "surface_brush_handoff_begin", None) if _TOOL_BRIDGE is not None else None\n'
+              '    end = getattr(_TOOL_BRIDGE, "surface_brush_handoff_end", None) if _TOOL_BRIDGE is not None else None\n'
+              '    window, area, region = target\n'
+              '    invert = bool(getattr(event, "alt", False))\n'
+              '\n'
+              '    try:\n'
+              '        with bpy.context.temp_override(window=window, area=area, region=region):\n'
+              '            routed_context = bpy.context\n'
+              '            if not callable(begin) or not bool(begin(routed_context)):\n'
+              '                _trace("surface_brush_tool_handoff_unavailable", routed_context, event)\n'
+              '                return False\n'
+              '\n'
+              '            try:\n'
+              '                # This invoke now happens while a real brush WorkSpaceTool is\n'
+              '                # active, so Blender\'s own operator poll and over_mesh test\n'
+              '                # are authoritative. No LumaFold ray-cast is involved.\n'
+              '                sculpt_result = _native_mask_stroke(routed_context, invert)\n'
+              '            finally:\n'
+              '                # SCULPT_OT_brush_stroke has already created its modal and\n'
+              '                # captured the temporary Mask brush at this point. Re-highlight\n'
+              '                # the native Mask gesture tool immediately for the Ctrl session.\n'
+              '                if callable(end):\n'
+              '                    end(routed_context)\n'
+              '\n'
+              '            if "RUNNING_MODAL" in sculpt_result or "FINISHED" in sculpt_result:\n'
+              '                _trace(\n'
+              '                    "surface_mask_native_brush_owned", routed_context, event,\n'
+              '                    result=sorted(sculpt_result),\n'
+              '                )\n'
+              '                return True\n'
+              '\n'
+              '            if "PASS_THROUGH" not in sculpt_result:\n'
+              '                # CANCELLED/error is not proof of background. Do not invent\n'
+              '                # a gesture classification.\n'
+              '                _trace(\n'
+              '                    "surface_mask_native_brush_failed", routed_context, event,\n'
+              '                    result=sorted(sculpt_result),\n'
+              '                )\n'
+              '                return False\n'
+              '\n'
+              '            # Blender itself rejected the press as background. The Mask tool\n'
+              '            # is active again now, so hand the same press to the remembered\n'
+              '            # native Box/Lasso/Line/Polyline gesture.\n'
+              '            state = _bridge_state(routed_context)\n'
+              '            tool_id = str(state.get("tool_id") or _bridge_current_tool(routed_context))\n'
+              '            if tool_id not in _TOOL_TO_OPERATOR:\n'
+              '                tool_id = "builtin.box_mask"\n'
+              '            result = _invoke_native_background_gesture(\n'
+              '                routed_context, tool_id, erase=invert,\n'
+              '            )\n'
+              '            ok = bool({"RUNNING_MODAL", "FINISHED"} & set(result or ()))\n'
+              '            _trace(\n'
+              '                "background_mask_native_tool_owned" if ok else "background_mask_native_tool_failed",\n'
+              '                routed_context, event, tool=tool_id, result=sorted(result or ()),\n'
+              '            )\n'
+              '            return ok\n'
+              '    except (RuntimeError, TypeError, AttributeError) as exc:\n'
+              '        _trace(\n'
+              '            "ctrl_mask_native_handoff_exception", context, event,\n'
+              '            error=f"{type(exc).__name__}: {exc}",\n'
+              '        )\n'
+              '        return False\n'
+              '\n'
+              '\n'
+          )
+          g = g[:start] + new_handle + g[end:]
+          compile(g, str(gesture), 'exec')
+          gesture.write_text(g, encoding='utf-8', newline='\n')
+
+          # Contract gates: no custom ray-cast in the route, native Mask brush
+          # operator remains the surface/background authority.
+          route = (work/'runtime/sculpt_route_truth.py').read_text(encoding='utf-8')
+          native = (work/'runtime/sculpt_native_pointer.py').read_text(encoding='utf-8')
+          init = (work/'__init__.py').read_text(encoding='utf-8')
+
+          assert 'def surface_brush_handoff_begin(' in t
+          assert 'def surface_brush_handoff_end(' in t
+          assert 'surface_mask_native_brush_owned' in g
+          assert 'background_mask_native_tool_owned' in g
+          assert '_surface_hit_xy(' not in g[g.index('def handle_pointer_press'):g.index('def install', g.index('def handle_pointer_press'))]
+          assert 'ignore_background_click=True' in g
+          assert 'brush_toggle="MASK"' in g
+          assert 'if event_type == "LEFTMOUSE" and ctrl and _MASK_GESTURE is not None:' in route
+          assert 'ignore_background_click=True' in native
+          assert 'sculpt_mask_gesture.install' in init
+          assert '"input_profile": "zbrush"' in m
+
+          # Preserve accepted V17 host/preview behavior.
+          sat = (work/'desktop/satellite_host.py').read_text(encoding='utf-8')
+          sat_rt = (work/'desktop/satellite_host_runtime.py').read_text(encoding='utf-8')
+          secondary = (work/'desktop/secondary_surface_host.py').read_text(encoding='utf-8')
+          bridge = (work/'desktop/bridge_server.py').read_text(encoding='utf-8')
+          assert '_restore_blender_foreground_if_satellite_activated()' in sat
+          assert '_mirror_quick_shortcut_selection()' in sat
+          assert 'host_switch_hit_test(x, y)' in sat
+          assert 'if key == "brush_preview_cache":' in sat_rt
+          assert 'sculpt.brush.library_replace_slot' in secondary
+          assert 'def _sculpt_visual_state(self):' in bridge
+
+          for f in work.rglob('*.py'):
+              compile(f.read_text(encoding='utf-8'), str(f), 'exec')
+
+          out.unlink(missing_ok=True)
+          with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+              for f in sorted(work.rglob('*')):
+                  if f.is_file():
+                      z.write(f, f.relative_to(work).as_posix())
+
+          digest = hashlib.sha256(out.read_bytes()).hexdigest()
+          out.with_suffix(out.suffix+'.sha256.txt').write_text(
+              f'{digest}  {out.name}\n', encoding='utf-8'
+          )
+          print('SHA256', digest)
+          '@ | Set-Content $py -Encoding UTF8
+          python $py
+
+      - name: Blender 5.2.0 and 5.2.2 extension validation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pkg = (Resolve-Path "$PWD/manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v21-ctrl-mask-handoff.zip").Path
+          foreach ($v in @('5.2.0','5.2.2')) {
+            $z = Join-Path $env:RUNNER_TEMP "blender-$v.zip"
+            $d = Join-Path $env:RUNNER_TEMP "blender-$v"
+            curl.exe -L --fail --retry 3 "https://download.blender.org/release/Blender5.2/blender-$v-windows-x64.zip" -o $z
+            if ($LASTEXITCODE -ne 0) { throw "Blender $v download failed" }
+            Expand-Archive $z $d -Force
+            $exe = Get-ChildItem $d -Filter blender.exe -Recurse | Select-Object -First 1
+            if (-not $exe) { throw "Blender $v executable missing" }
+            & $exe.FullName --command extension validate $pkg
+            if ($LASTEXITCODE -ne 0) { throw "Blender $v validation failed" }
+          }
+
+      - name: Publish
+        shell: pwsh
+        run: |
+          git config user.name 'LumaFold Build Bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v21-ctrl-mask-handoff.zip*
+          git commit -m "candidate: native brush-tool handoff for Ctrl Mask"
+          git push origin HEAD:main
