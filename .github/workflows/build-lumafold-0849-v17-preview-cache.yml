@@ -82,37 +82,38 @@ jobs:
           fn = b[fn_start:fn_end]
 
           old = '        visual = {key: sculpt_state.get(key) for key in keys if key in sculpt_state}\n'
-          new = '''        visual = {key: sculpt_state.get(key) for key in keys if key in sculpt_state}
-
-              # Quick Brush previews are accumulated by primary_visual_assets in
-              # primary_brush_preview_cache. The legacy brush_preview_cache only
-              # receives the brushes that have actually become current. Build one
-              # compact complete cache for the visible Quick Brush slots from both.
-              primary_cache = dict(sculpt_state.get("primary_brush_preview_cache") or {})
-              legacy_cache = dict(sculpt_state.get("brush_preview_cache") or {})
-              slots = list(sculpt_state.get("quick_brush_slots") or ())
-              try:
-                  rows = max(2, min(4, int(sculpt_state.get("quick_rows", 2) or 2)))
-              except Exception:
-                  rows = 2
-
-              compact = {}
-              for slot in slots[: rows * 4]:
-                  slot = dict(slot or {})
-                  rel = str(slot.get("relative_asset_identifier") or "").replace("\\\\", "/").strip()
-                  if not rel:
-                      continue
-                  identity = "asset|{}|{}|{}".format(
-                      str(slot.get("asset_library_type") or "").casefold(),
-                      str(slot.get("asset_library_identifier") or "").casefold(),
-                      rel.casefold(),
-                  )
-                  payload = dict(primary_cache.get(identity) or legacy_cache.get(identity) or {})
-                  if payload.get("rgba_b64"):
-                      payload["key"] = identity
-                      compact[identity] = payload
-              visual["brush_preview_cache"] = compact
-          '''
+          new = (
+              '        visual = {key: sculpt_state.get(key) for key in keys if key in sculpt_state}\n'
+              '\n'
+              '        # Quick Brush previews are accumulated by primary_visual_assets in\n'
+              '        # primary_brush_preview_cache. The legacy brush_preview_cache only\n'
+              '        # receives brushes that have actually become current. Build one\n'
+              '        # compact complete cache for the visible Quick Brush slots from both.\n'
+              '        primary_cache = dict(sculpt_state.get("primary_brush_preview_cache") or {})\n'
+              '        legacy_cache = dict(sculpt_state.get("brush_preview_cache") or {})\n'
+              '        slots = list(sculpt_state.get("quick_brush_slots") or ())\n'
+              '        try:\n'
+              '            rows = max(2, min(4, int(sculpt_state.get("quick_rows", 2) or 2)))\n'
+              '        except Exception:\n'
+              '            rows = 2\n'
+              '\n'
+              '        compact = {}\n'
+              '        for slot in slots[: rows * 4]:\n'
+              '            slot = dict(slot or {})\n'
+              '            rel = str(slot.get("relative_asset_identifier") or "").replace("\\\\", "/").strip()\n'
+              '            if not rel:\n'
+              '                continue\n'
+              '            identity = "asset|{}|{}|{}".format(\n'
+              '                str(slot.get("asset_library_type") or "").casefold(),\n'
+              '                str(slot.get("asset_library_identifier") or "").casefold(),\n'
+              '                rel.casefold(),\n'
+              '            )\n'
+              '            payload = dict(primary_cache.get(identity) or legacy_cache.get(identity) or {})\n'
+              '            if payload.get("rgba_b64"):\n'
+              '                payload["key"] = identity\n'
+              '                compact[identity] = payload\n'
+              '        visual["brush_preview_cache"] = compact\n'
+          )
           if old not in fn:
               raise SystemExit('V16 visual-state cache assignment not found')
           fn = fn.replace(old, new, 1)
