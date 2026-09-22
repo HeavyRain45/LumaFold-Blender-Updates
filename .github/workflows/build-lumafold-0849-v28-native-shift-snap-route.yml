@@ -1,0 +1,203 @@
+name: Build LumaFold 0.8.49 V28 Native Shift Snap Route
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build-lumafold-0849-v28-native-shift-snap-route.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch V27
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $py = Join-Path $env:RUNNER_TEMP 'v28.py'
+          @'
+          import pathlib, zipfile, shutil, hashlib, os
+
+          root = pathlib.Path.cwd()
+          src = root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v27-first-click-shift-snap.zip'
+          out = root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v28-native-shift-snap-route.zip'
+          work = pathlib.Path(os.environ['RUNNER_TEMP'])/'lf_v28'
+          shutil.rmtree(work, ignore_errors=True)
+          work.mkdir(parents=True)
+          with zipfile.ZipFile(src) as z:
+              z.extractall(work)
+
+          # ==============================================================
+          # Root cause:
+          # plain pen/LMB background orbit is started by sculpt_native_pointer,
+          # which previously called VIEW3D_OT_rotate directly and bypassed the
+          # V27 Shift -> native AXIS_SNAP bridge in sculpt_navigation.
+          #
+          # V28 makes sculpt_navigation the single LumaFold native-rotate
+          # gateway. Both the generic navigation handoff and the native
+          # Sculpt-vs-background pointer arbiter use the same gateway.
+          # Blender's permanent/user keymap is not persisted or rewritten.
+          # ==============================================================
+
+          nav = work/'runtime/sculpt_navigation.py'
+          n = nav.read_text(encoding='utf-8').replace('\r\n','\n')
+
+          old_decl = 'def _invoke_blender_rotate(target) -> bool:\n'
+          if old_decl not in n:
+              raise SystemExit('V27 native rotate gateway not found')
+          n = n.replace(old_decl, 'def invoke_blender_rotate(target) -> bool:\n', 1)
+
+          handoff_anchor = '\n\ndef try_native_navigation(context, event, target, *, host=None):'
+          if handoff_anchor not in n:
+              raise SystemExit('navigation handoff anchor missing')
+          wrapper = (
+              '\n\ndef _invoke_blender_rotate(target) -> bool:\n'
+              '    """Compatibility wrapper; all LumaFold rotate starts share one gateway."""\n'
+              '    return invoke_blender_rotate(target)\n'
+          )
+          n = n.replace(handoff_anchor, wrapper + handoff_anchor, 1)
+
+          # Prefer Blender's operator-resolved modal map if available. Fall back
+          # to the exact existing map name used by V27. We still NEVER create a
+          # replacement modal map and remove only our two temporary Shift pairs.
+          old_lookup = '''    try:
+              km = kc.keymaps.find(
+                  "View3D Rotate Modal", space_type="EMPTY", region_type="WINDOW"
+              )
+          except Exception:
+              km = None
+          '''
+          new_lookup = '''    try:
+              finder = getattr(kc.keymaps, "find_modal", None)
+              km = finder("VIEW3D_OT_rotate") if callable(finder) else None
+          except Exception:
+              km = None
+          if km is None:
+              try:
+                  km = kc.keymaps.find(
+                      "View3D Rotate Modal", space_type="EMPTY", region_type="WINDOW"
+                  )
+              except Exception:
+                  km = None
+          '''
+          if old_lookup in n:
+              n = n.replace(old_lookup, new_lookup, 1)
+
+          compile(n, str(nav), 'exec')
+          nav.write_text(n, encoding='utf-8', newline='\n')
+
+          pointer = work/'runtime/sculpt_native_pointer.py'
+          p = pointer.read_text(encoding='utf-8').replace('\r\n','\n')
+
+          if 'import importlib\n' not in p:
+              p = p.replace('import bpy\n', 'import importlib\n\nimport bpy\n', 1)
+
+          pstart = p.index('def _invoke_rotate(target) -> bool:')
+          pend = p.index('\n\ndef arbitrate_plain_lmb', pstart)
+          replacement = '''def _invoke_rotate(target) -> bool:
+              """Start background orbit through LumaFold's single native gateway."""
+              try:
+                  navigation = importlib.import_module(__package__ + ".sculpt_navigation")
+                  invoke = getattr(navigation, "invoke_blender_rotate", None)
+                  if not callable(invoke):
+                      return False
+                  return bool(invoke(target))
+              except (RuntimeError, TypeError, AttributeError, ImportError):
+                  return False
+          '''
+          p = p[:pstart] + replacement + p[pend:]
+
+          compile(p, str(pointer), 'exec')
+          pointer.write_text(p, encoding='utf-8', newline='\n')
+
+          # ==============================================================
+          # Regression gates
+          # ==============================================================
+          view = (work/'ui/sculpt_view.py').read_text(encoding='utf-8')
+          secondary = (work/'desktop/secondary_surface_host.py').read_text(encoding='utf-8')
+          mask = (work/'runtime/sculpt_mask_gesture.py').read_text(encoding='utf-8')
+          route = (work/'runtime/sculpt_route_truth.py').read_text(encoding='utf-8')
+          sat = (work/'desktop/satellite_host.py').read_text(encoding='utf-8')
+          sat_rt = (work/'desktop/satellite_host_runtime.py').read_text(encoding='utf-8')
+
+          # V27 first-click behavior remains.
+          assert 'pressed_preview = False' in view
+          assert 'imgui_arg.is_mouse_clicked(0)' in view
+          assert '_open_targeted_library(int(ident)' in view
+
+          # One native rotate gateway owns Shift axis-snap setup.
+          assert 'def invoke_blender_rotate(target) -> bool:' in n
+          assert 'AXIS_SNAP_ENABLE' in n and 'AXIS_SNAP_DISABLE' in n
+          assert 'LEFT_SHIFT' in n and 'RIGHT_SHIFT' in n
+          assert '_native_rotate_alive' in n
+          assert 'bpy.ops.view3d.rotate("INVOKE_DEFAULT")' in n
+          assert 'invoke_blender_rotate(target)' in p
+          assert 'bpy.ops.view3d.rotate("INVOKE_DEFAULT")' not in p
+
+          # Plain pen/LMB background route still uses Blender as hit-test truth.
+          assert 'ignore_background_click=True' in p
+          assert 'if "PASS_THROUGH" in sculpt_result:' in p
+          assert 'return ROTATE if _invoke_rotate(target) else FALLBACK' in p
+
+          # Preserve V25 preview pipeline + V23a Mask + Satellite fixes.
+          assert 'on_request_preview=_request_brush_previews_exact' in secondary
+          assert '_BRUSH_PREVIEW_QUEUE_LIMIT = 4' in secondary
+          assert 'clean_age >= 0.18' in secondary
+          assert '_CLASSES = (LUMAFOLD_OT_sculpt_mask_gesture_v2,)' in mask
+          assert 'mask_feather_tap' in mask
+          assert 'mask_sharpen_tap' in mask
+          assert 'background_invert_tap' in mask
+          assert 'satellite_pointer_guard' in route
+          assert 'satellite_client_pointer_reprime' in sat
+          assert '_restore_blender_foreground_if_satellite_activated()' in sat
+          assert '_mirror_quick_shortcut_selection()' in sat
+          assert 'host_switch_hit_test(x, y)' in sat
+          assert 'if key == "brush_preview_cache":' in sat_rt
+
+          for py in work.rglob('*.py'):
+              compile(py.read_text(encoding='utf-8'), str(py), 'exec')
+
+          out.unlink(missing_ok=True)
+          with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+              for file in sorted(work.rglob('*')):
+                  if file.is_file():
+                      z.write(file, file.relative_to(work).as_posix())
+
+          digest = hashlib.sha256(out.read_bytes()).hexdigest()
+          out.with_suffix(out.suffix+'.sha256.txt').write_text(
+              f'{digest}  {out.name}\n', encoding='utf-8'
+          )
+          print('SHA256', digest)
+          '@ | Set-Content $py -Encoding UTF8
+          python $py
+
+      - name: Blender 5.2.0 and 5.2.2 extension validation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pkg = (Resolve-Path "$PWD/manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v28-native-shift-snap-route.zip").Path
+          foreach ($v in @('5.2.0','5.2.2')) {
+            $z = Join-Path $env:RUNNER_TEMP "blender-$v.zip"
+            $d = Join-Path $env:RUNNER_TEMP "blender-$v"
+            curl.exe -L --fail --retry 3 "https://download.blender.org/release/Blender5.2/blender-$v-windows-x64.zip" -o $z
+            if ($LASTEXITCODE -ne 0) { throw "Blender $v download failed" }
+            Expand-Archive $z $d -Force
+            $exe = Get-ChildItem $d -Filter blender.exe -Recurse | Select-Object -First 1
+            if (-not $exe) { throw "Blender $v executable missing" }
+            & $exe.FullName --command extension validate $pkg
+            if ($LASTEXITCODE -ne 0) { throw "Blender $v validation failed" }
+          }
+
+      - name: Publish
+        shell: pwsh
+        run: |
+          git config user.name 'LumaFold Build Bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v28-native-shift-snap-route.zip*
+          git commit -m "candidate: route pen rotate through native Shift snap bridge"
+          git push origin HEAD:main
