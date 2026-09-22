@@ -1,0 +1,219 @@
+name: Build LumaFold 0.8.49 V20 Ctrl Mask Native Arbiter
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build-lumafold-0849-v20-ctrl-mask-native-arbiter.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch V17 with Blender-native Ctrl Mask arbitration
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $py = Join-Path $env:RUNNER_TEMP 'v20.py'
+          @'
+          import pathlib, zipfile, shutil, hashlib, os
+
+          root = pathlib.Path.cwd()
+          src = root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v17-preview-cache.zip'
+          out = root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v20-ctrl-mask-native-arbiter.zip'
+          work = pathlib.Path(os.environ['RUNNER_TEMP'])/'lf_v20'
+          shutil.rmtree(work, ignore_errors=True)
+          work.mkdir(parents=True)
+          with zipfile.ZipFile(src) as z:
+              z.extractall(work)
+
+          # Fresh installs use the intended ZBrush input profile.
+          sculpt = work/'modules/sculpt.py'
+          m = sculpt.read_text(encoding='utf-8').replace('\r\n','\n')
+          anchor = '        "alpha_slot": 0,\n'
+          default_line = '        "input_profile": "zbrush",\n'
+          if default_line not in m:
+              if anchor not in m:
+                  raise SystemExit('sculpt defaults anchor missing')
+              m = m.replace(anchor, anchor + default_line, 1)
+          compile(m, str(sculpt), 'exec')
+          sculpt.write_text(m, encoding='utf-8', newline='\n')
+
+          # --------------------------------------------------------------
+          # Ctrl Mask arbitration must use Blender's own over_mesh decision.
+          # The plain Sculpt path already proved this production boundary:
+          #   brush_stroke(ignore_background_click=True)
+          #     RUNNING_MODAL / FINISHED => Blender says "surface"
+          #     PASS_THROUGH             => Blender says "background"
+          # Never duplicate that truth with our own ray-cast.
+          # --------------------------------------------------------------
+          gesture = work/'runtime/sculpt_mask_gesture.py'
+          g = gesture.read_text(encoding='utf-8').replace('\r\n','\n')
+
+          # Add a target-based native mask invoke that exposes Blender's result.
+          if 'def _native_mask_stroke_target(' not in g:
+              insert_at = g.index('def _native_mask_stroke(context, invert: bool):')
+              end_fn = g.index('\n\ndef _active_tool_properties', insert_at)
+              helper = (
+                  '\n\ndef _native_mask_stroke_target(target, invert: bool):\n'
+                  '    """Ask Blender itself whether this press belongs to the sculpt surface."""\n'
+                  '    if target is None:\n'
+                  '        return set()\n'
+                  '    window, area, region = target\n'
+                  '    try:\n'
+                  '        with bpy.context.temp_override(window=window, area=area, region=region):\n'
+                  '            return set(\n'
+                  '                bpy.ops.sculpt.brush_stroke(\n'
+                  '                    "INVOKE_DEFAULT",\n'
+                  '                    True,\n'
+                  '                    mode="INVERT" if invert else "NORMAL",\n'
+                  '                    brush_toggle="MASK",\n'
+                  '                    ignore_background_click=True,\n'
+                  '                )\n'
+                  '                or ()\n'
+                  '            )\n'
+                  '    except (RuntimeError, TypeError, AttributeError):\n'
+                  '        return set()\n'
+              )
+              g = g[:end_fn] + helper + g[end_fn:]
+
+          start = g.index('def handle_pointer_press(context, event, target):')
+          end = g.index('\ndef install(', start)
+          new_handle = (
+              'def handle_pointer_press(context, event, target):\n'
+              '    if str(getattr(event, "type", "") or "").upper() != "LEFTMOUSE":\n'
+              '        return None\n'
+              '    if str(getattr(event, "value", "") or "").upper() != "PRESS":\n'
+              '        return None\n'
+              '    if not bool(getattr(event, "ctrl", False)) or bool(getattr(event, "shift", False)):\n'
+              '        return None\n'
+              '    if target is None:\n'
+              '        return False\n'
+              '\n'
+              '    invert = bool(getattr(event, "alt", False))\n'
+              '\n'
+              '    # One authority only: Blender Sculpt itself decides whether the\n'
+              '    # original press is over the active sculpt mesh. This avoids the\n'
+              '    # intermittent false-background classifications produced by our\n'
+              '    # old evaluated ray-cast, especially with tablet press samples.\n'
+              '    sculpt_result = _native_mask_stroke_target(target, invert)\n'
+              '    if "RUNNING_MODAL" in sculpt_result or "FINISHED" in sculpt_result:\n'
+              '        _trace(\n'
+              '            "surface_mask_blender_owned", context, event,\n'
+              '            result=sorted(sculpt_result),\n'
+              '        )\n'
+              '        return True\n'
+              '\n'
+              '    if "PASS_THROUGH" in sculpt_result:\n'
+              '        window, area, region = target\n'
+              '        try:\n'
+              '            with bpy.context.temp_override(window=window, area=area, region=region):\n'
+              '                routed_context = bpy.context\n'
+              '                state = _bridge_state(routed_context)\n'
+              '                tool_id = str(state.get("tool_id") or _bridge_current_tool(routed_context))\n'
+              '                if tool_id not in _TOOL_TO_OPERATOR:\n'
+              '                    tool_id = "builtin.box_mask"\n'
+              '                result = _invoke_native_background_gesture(\n'
+              '                    routed_context, tool_id, erase=invert,\n'
+              '                )\n'
+              '        except (RuntimeError, TypeError, AttributeError):\n'
+              '            result = {"CANCELLED"}\n'
+              '            tool_id = ""\n'
+              '        ok = bool({"RUNNING_MODAL", "FINISHED"} & set(result or ()))\n'
+              '        _trace(\n'
+              '            "background_mask_tool_owned" if ok else "background_mask_tool_failed",\n'
+              '            context, event, tool=tool_id, result=sorted(result or ()),\n'
+              '        )\n'
+              '        return ok\n'
+              '\n'
+              '    # CANCELLED/error is not proof of background. Fail closed and let\n'
+              '    # Blender continue normal event processing instead of inventing a\n'
+              '    # tool-gesture classification.\n'
+              '    _trace(\n'
+              '        "mask_native_arbiter_fallback", context, event,\n'
+              '        result=sorted(sculpt_result),\n'
+              '    )\n'
+              '    return False\n'
+              '\n'
+              '\n'
+          )
+          g = g[:start] + new_handle + g[end:]
+          compile(g, str(gesture), 'exec')
+          gesture.write_text(g, encoding='utf-8', newline='\n')
+
+          # Contract gates.
+          route = (work/'runtime/sculpt_route_truth.py').read_text(encoding='utf-8')
+          native = (work/'runtime/sculpt_native_pointer.py').read_text(encoding='utf-8')
+          tool = (work/'runtime/sculpt_mask_tool_bridge.py').read_text(encoding='utf-8')
+          init = (work/'__init__.py').read_text(encoding='utf-8')
+
+          assert 'ignore_background_click=True' in native
+          assert 'if "PASS_THROUGH" in sculpt_result:' in g
+          assert 'surface_mask_blender_owned' in g
+          assert 'background_mask_tool_owned' in g
+          assert 'brush_toggle="MASK"' in g
+          assert 'if event_type == "LEFTMOUSE" and ctrl and _MASK_GESTURE is not None:' in route
+          assert 'state["ctrl_held"] = True' in tool
+          assert '_set_tool(context, mask_tool)' in tool
+          assert 'sculpt_mask_gesture.install' in init
+          assert '"input_profile": "zbrush"' in m
+
+          # Preserve accepted V17 behavior.
+          sat = (work/'desktop/satellite_host.py').read_text(encoding='utf-8')
+          sat_rt = (work/'desktop/satellite_host_runtime.py').read_text(encoding='utf-8')
+          secondary = (work/'desktop/secondary_surface_host.py').read_text(encoding='utf-8')
+          bridge = (work/'desktop/bridge_server.py').read_text(encoding='utf-8')
+          assert '_restore_blender_foreground_if_satellite_activated()' in sat
+          assert '_mirror_quick_shortcut_selection()' in sat
+          assert 'host_switch_hit_test(x, y)' in sat
+          assert 'if key == "brush_preview_cache":' in sat_rt
+          assert 'sculpt.brush.library_replace_slot' in secondary
+          assert 'def _sculpt_visual_state(self):' in bridge
+
+          for f in work.rglob('*.py'):
+              compile(f.read_text(encoding='utf-8'), str(f), 'exec')
+
+          out.unlink(missing_ok=True)
+          with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+              for f in sorted(work.rglob('*')):
+                  if f.is_file():
+                      z.write(f, f.relative_to(work).as_posix())
+
+          digest = hashlib.sha256(out.read_bytes()).hexdigest()
+          out.with_suffix(out.suffix+'.sha256.txt').write_text(
+              f'{digest}  {out.name}\n', encoding='utf-8'
+          )
+          print('SHA256', digest)
+          '@ | Set-Content $py -Encoding UTF8
+          python $py
+
+      - name: Blender 5.2.0 and 5.2.2 extension validation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pkg = (Resolve-Path "$PWD/manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v20-ctrl-mask-native-arbiter.zip").Path
+          foreach ($v in @('5.2.0','5.2.2')) {
+            $z = Join-Path $env:RUNNER_TEMP "blender-$v.zip"
+            $d = Join-Path $env:RUNNER_TEMP "blender-$v"
+            curl.exe -L --fail --retry 3 "https://download.blender.org/release/Blender5.2/blender-$v-windows-x64.zip" -o $z
+            if ($LASTEXITCODE -ne 0) { throw "Blender $v download failed" }
+            Expand-Archive $z $d -Force
+            $exe = Get-ChildItem $d -Filter blender.exe -Recurse | Select-Object -First 1
+            if (-not $exe) { throw "Blender $v executable missing" }
+            & $exe.FullName --command extension validate $pkg
+            if ($LASTEXITCODE -ne 0) { throw "Blender $v validation failed" }
+          }
+
+      - name: Publish
+        shell: pwsh
+        run: |
+          git config user.name 'LumaFold Build Bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v20-ctrl-mask-native-arbiter.zip*
+          git commit -m "candidate: let Blender arbitrate Ctrl Mask surface ownership"
+          git push origin HEAD:main
