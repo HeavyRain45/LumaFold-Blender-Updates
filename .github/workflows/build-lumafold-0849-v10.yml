@@ -1,0 +1,87 @@
+name: Build LumaFold 0.8.49 V10
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build-lumafold-0849-v10.yml']
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch V9
+        shell: pwsh
+        run: |
+          $py = Join-Path $env:RUNNER_TEMP 'v10.py'
+          @'
+          import pathlib, zipfile, shutil, hashlib, os
+          root=pathlib.Path.cwd()
+          src=root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v9.zip'
+          out=root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v10.zip'
+          work=pathlib.Path(os.environ['RUNNER_TEMP'])/'lf_v10'
+          shutil.rmtree(work,ignore_errors=True); work.mkdir()
+          with zipfile.ZipFile(src) as z: z.extractall(work)
+          p=work/'desktop/satellite_host.py'
+          t=p.read_text(encoding='utf-8').replace('\r\n','\n')
+          marker='def _prime_pointer_focus():\n'
+          helper='''def _restore_blender_foreground_if_satellite_activated():
+              if _interactions.shortcut_capture_active():
+                  return False
+              try:
+                  fg = int(_runtime.user32.GetForegroundWindow() or 0)
+                  ours = {int(_runtime.hwnd_main or 0), int(_runtime.secondary_hwnd or 0)}
+                  ours.discard(0)
+                  if fg not in ours:
+                      return False
+                  owner = int(_runtime.ARGS.owner_hwnd or 0)
+                  if not owner or not _runtime.user32.IsWindow(_runtime.HWND(owner)):
+                      return False
+                  return bool(_runtime.user32.SetForegroundWindow(_runtime.HWND(owner)))
+              except Exception:
+                  return False
+
+
+          def _prime_pointer_focus():
+          '''
+          if '_restore_blender_foreground_if_satellite_activated' not in t:
+              assert marker in t
+              t=t.replace(marker,helper,1)
+          a='    if int(msg) == WM_MOUSEACTIVATE and not _interactions.shortcut_capture_active():\n        _prime_pointer_focus()\n'
+          b='    if int(msg) == WM_MOUSEACTIVATE and not _interactions.shortcut_capture_active():\n        _prime_pointer_focus()\n        _restore_blender_foreground_if_satellite_activated()\n'
+          if b not in t:
+              assert a in t
+              t=t.replace(a,b,1)
+          a='    _sync_target_slot_to_secondary()\n    _sync_shortcut_focus_policy()\n\n'
+          b='    _sync_target_slot_to_secondary()\n    _sync_shortcut_focus_policy()\n    _restore_blender_foreground_if_satellite_activated()\n\n'
+          if b not in t:
+              assert a in t
+              t=t.replace(a,b,1)
+          compile(t,str(p),'exec'); p.write_text(t,encoding='utf-8',newline='\n')
+          out.unlink(missing_ok=True)
+          with zipfile.ZipFile(out,'w',zipfile.ZIP_DEFLATED,compresslevel=9) as z:
+              for f in sorted(work.rglob('*')):
+                  if f.is_file(): z.write(f,f.relative_to(work).as_posix())
+          h=hashlib.sha256(out.read_bytes()).hexdigest()
+          out.with_suffix(out.suffix+'.sha256.txt').write_text(f'{h}  {out.name}\n',encoding='utf-8')
+          print(h)
+          '@ | Set-Content $py -Encoding UTF8
+          python $py
+      - name: Validate
+        shell: pwsh
+        run: |
+          $v='5.2.2'; $z="$env:RUNNER_TEMP\blender.zip"; $d="$env:RUNNER_TEMP\blender"
+          curl.exe -L --fail "https://download.blender.org/release/Blender5.2/blender-$v-windows-x64.zip" -o $z
+          Expand-Archive $z $d -Force
+          $exe=Get-ChildItem $d -Filter blender.exe -Recurse | Select-Object -First 1
+          & $exe.FullName --command extension validate "$PWD/manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v10.zip"
+          if ($LASTEXITCODE -ne 0) { throw 'validation failed' }
+      - name: Publish
+        shell: pwsh
+        run: |
+          git config user.name 'LumaFold Build Bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v10.zip*
+          git commit -m "candidate: Satellite foreground keeper V10"
+          git push origin HEAD:main
