@@ -59,19 +59,20 @@ jobs:
           #    Returning True lets the frozen foundation perform the normal
           #    quick_slot selection transaction in the same frame.
           # --------------------------------------------------------------
-          old = '''        if clicked_preview:
-              _open_targeted_library(int(ident), _foundation._item_anchor(imgui_arg, scale_arg))
-              return False
-          '''
-          new = '''        if clicked_preview:
-              _open_targeted_library(int(ident), _foundation._item_anchor(imgui_arg, scale_arg))
-              # Keep the normal Quick Brush selection path alive as well:
-              # icon click selects this slot and opens its replacement library.
-              return True
-          '''
-          if old not in v:
-              raise SystemExit('Quick Brush preview-click branch missing')
-          v = v.replace(old, new, 1)
+          quick_start = v.index('    def _quick_widget(')
+          quick_end = v.index('\n    def _button_product', quick_start)
+          quick = v[quick_start:quick_end]
+          click_pos = quick.index('        if clicked_preview:')
+          return_false = quick.index('            return False', click_pos)
+          if return_false < 0:
+              raise SystemExit('Quick Brush preview-click return False missing')
+          quick = (
+              quick[:return_false]
+              + '            # Preview click keeps normal slot selection alive while opening the library.\n'
+              + '            return True'
+              + quick[return_false + len('            return False'):]
+          )
+          v = v[:quick_start] + quick + v[quick_end:]
 
           compile(v, str(view), 'exec')
           view.write_text(v, encoding='utf-8', newline='\n')
