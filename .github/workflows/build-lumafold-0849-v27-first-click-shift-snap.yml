@@ -1,0 +1,458 @@
+name: Build LumaFold 0.8.49 V27 First Click + Shift Snap
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build-lumafold-0849-v27-first-click-shift-snap.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch V26
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $py = Join-Path $env:RUNNER_TEMP 'v27.py'
+          @'
+          import pathlib, zipfile, shutil, hashlib, os
+
+          root = pathlib.Path.cwd()
+          src = root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v26-quickbrush-click.zip'
+          out = root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v27-first-click-shift-snap.zip'
+          work = pathlib.Path(os.environ['RUNNER_TEMP'])/'lf_v27'
+          shutil.rmtree(work, ignore_errors=True)
+          work.mkdir(parents=True)
+          with zipfile.ZipFile(src) as z:
+              z.extractall(work)
+
+          # ==============================================================
+          # A) Satellite Quick Brush first click:
+          #    the non-activating Satellite can occasionally miss ImGui's
+          #    release-side Click on the very first pointer interaction.
+          #    Commit the preview/icon action on ImGui mouse-down while the
+          #    item is hovered. Name-strip behavior remains release-click only.
+          # ==============================================================
+          view = work/'ui/sculpt_view.py'
+          v = view.read_text(encoding='utf-8').replace('\r\n','\n')
+
+          qstart = v.index('    def _quick_widget(')
+          qend = v.index('\n    def _button_product', qstart)
+          qb = v[qstart:qend]
+
+          old_head = '''        clicked = _visual_quick_slot_widget(
+              imgui_arg, sculpt, label, ident, scale_arg, width_px, selected, empty, tex_id,
+          )
+              if not clicked or bool(empty):
+                  return bool(clicked)
+          '''
+          # V26 keeps the same visual widget but may differ only in comments.
+          if old_head not in qb:
+              old_head = '''        clicked = _visual_quick_slot_widget(
+              imgui_arg, sculpt, label, ident, scale_arg, width_px, selected, empty, tex_id,
+          )
+          if not clicked or bool(empty):
+              return bool(clicked)
+          '''
+          new_head = '''        clicked = _visual_quick_slot_widget(
+              imgui_arg, sculpt, label, ident, scale_arg, width_px, selected, empty, tex_id,
+          )
+
+          # Satellite is WS_EX_NOACTIVATE. On the first interaction Windows can
+          # deliver the press reliably while ImGui's release-side Click arrives
+          # only after pointer-focus repair. Detect the preview press edge here
+          # so one physical click always opens the library.
+          pressed_preview = False
+          try:
+              if not bool(empty) and bool(imgui_arg.is_item_hovered()) and bool(imgui_arg.is_mouse_clicked(0)):
+                  rmax_press = imgui_arg.get_item_rect_max()
+                  mouse_press = imgui_arg.get_mouse_pos()
+                  name_top_press = float(rmax_press[1]) - px(15.0, scale_arg)
+                  pressed_preview = float(mouse_press[1]) < name_top_press
+          except Exception:
+              pressed_preview = False
+
+          if pressed_preview:
+              _open_targeted_library(int(ident), _foundation._item_anchor(imgui_arg, scale_arg))
+              return True
+
+          if not clicked or bool(empty):
+              return bool(clicked)
+          '''
+          if old_head not in qb:
+              raise SystemExit('V26 Quick Brush widget head not found')
+          qb = qb.replace(old_head, new_head, 1)
+          v = v[:qstart] + qb + v[qend:]
+
+          compile(v, str(view), 'exec')
+          view.write_text(v, encoding='utf-8', newline='\n')
+
+          # ==============================================================
+          # B) Restore LumaFold Shift-to-native-axis-snap bridge.
+          #
+          # Blender's Rotate Modal already owns Alt axis snapping. We do not
+          # change Blender preferences or its permanent keymap. During ONLY a
+          # LumaFold-started native VIEW3D_OT_rotate session, temporarily add
+          # Shift PRESS/RELEASE to the EXISTING Rotate Modal map's native
+          # AXIS_SNAP_ENABLE/DISABLE actions, then remove those two temporary
+          # items as soon as that rotate modal ends.
+          #
+          # This is the previously proven LumaFold bridge from dev33, adapted
+          # onto the current stateless native-navigation route.
+          # ==============================================================
+          nav = work/'runtime/sculpt_navigation.py'
+          n = nav.read_text(encoding='utf-8').replace('\r\n','\n')
+
+          if 'import time\n' not in n:
+              n = n.replace('import importlib\n', 'import importlib\nimport time\n', 1)
+
+          globals_anchor = '_REGISTERED = False\n'
+          globals_add = '''_REGISTERED = False
+
+          _NATIVE_SESSIONS = {}
+          _NATIVE_TIMER_RUNNING = False
+          _SHIFT_MODAL_KM = None
+          _SHIFT_MODAL_ITEMS = []
+          _SHIFT_BRIDGE_ERROR = ""
+          _SHIFT_KEYS = ("LEFT_SHIFT", "RIGHT_SHIFT")
+          '''
+          if '_SHIFT_MODAL_ITEMS = []' not in n:
+              if globals_anchor not in n:
+                  raise SystemExit('navigation globals anchor missing')
+              n = n.replace(globals_anchor, globals_add, 1)
+
+          helper_anchor = 'def _runtime_state():\n'
+          if 'def _enable_native_shift_snap() -> bool:' not in n:
+              helpers = '''def _ptr(value) -> int:
+              try:
+                  return int(value.as_pointer())
+              except Exception:
+                  return 0
+
+
+          def _live_rotate_modal_keymap():
+              """Resolve Blender's existing Rotate modal map; never create/replace it."""
+              global _SHIFT_MODAL_KM
+              if _SHIFT_MODAL_KM is not None:
+                  try:
+                      if bool(_SHIFT_MODAL_KM.is_modal):
+                          return _SHIFT_MODAL_KM
+                  except Exception:
+                      pass
+                  _SHIFT_MODAL_KM = None
+
+              try:
+                  wm = bpy.context.window_manager
+                  kc = wm.keyconfigs.user
+              except Exception:
+                  kc = None
+              if kc is None:
+                  return None
+
+              try:
+                  km = kc.keymaps.find(
+                      "View3D Rotate Modal", space_type="EMPTY", region_type="WINDOW"
+                  )
+              except Exception:
+                  km = None
+              try:
+                  if km is not None and not bool(km.is_modal):
+                      km = None
+              except Exception:
+                  km = None
+              _SHIFT_MODAL_KM = km
+              return km
+
+
+          def _enable_native_shift_snap() -> bool:
+              global _SHIFT_BRIDGE_ERROR
+              if _SHIFT_MODAL_ITEMS:
+                  return True
+              km = _live_rotate_modal_keymap()
+              if km is None:
+                  _SHIFT_BRIDGE_ERROR = "Live View3D Rotate Modal keymap unavailable"
+                  return False
+
+              created = []
+              try:
+                  for key in _SHIFT_KEYS:
+                      created.append(km.keymap_items.new_modal(
+                          "AXIS_SNAP_ENABLE", key, "PRESS", any=True
+                      ))
+                      created.append(km.keymap_items.new_modal(
+                          "AXIS_SNAP_DISABLE", key, "RELEASE", any=True
+                      ))
+                  _SHIFT_MODAL_ITEMS.extend(created)
+                  _SHIFT_BRIDGE_ERROR = ""
+                  return True
+              except Exception as exc:
+                  _SHIFT_BRIDGE_ERROR = f"{type(exc).__name__}: {exc}"
+                  for item in created:
+                      try:
+                          km.keymap_items.remove(item)
+                      except Exception:
+                          pass
+                  _SHIFT_MODAL_ITEMS.clear()
+                  return False
+
+
+          def _disable_native_shift_snap():
+              km = _SHIFT_MODAL_KM
+              if km is not None:
+                  for item in tuple(_SHIFT_MODAL_ITEMS):
+                      try:
+                          km.keymap_items.remove(item)
+                      except Exception:
+                          pass
+              _SHIFT_MODAL_ITEMS.clear()
+
+
+          def _operator_identifier(op) -> str:
+              values = []
+              for attr in ("bl_idname", "idname", "name"):
+                  try:
+                      values.append(str(getattr(op, attr, "") or ""))
+                  except Exception:
+                      pass
+              for owner_name in ("bl_rna", "rna_type"):
+                  try:
+                      owner = getattr(op, owner_name, None)
+                      values.append(str(getattr(owner, "identifier", "") or ""))
+                  except Exception:
+                      pass
+              try:
+                  values.append(str(op))
+              except Exception:
+                  pass
+              return " | ".join(v for v in values if v)
+
+
+          def _native_rotate_alive(window) -> bool:
+              if window is None:
+                  return False
+              try:
+                  operators = tuple(window.modal_operators)
+              except Exception:
+                  return False
+              for op in operators:
+                  ident = _operator_identifier(op).upper()
+                  if "VIEW3D_OT_ROTATE" in ident or "VIEW3D.ROTATE" in ident:
+                      return True
+              return False
+
+
+          def _window_by_ptr(pointer: int):
+              try:
+                  for window in tuple(bpy.context.window_manager.windows):
+                      if _ptr(window) == int(pointer or 0):
+                          return window
+              except Exception:
+                  pass
+              return None
+
+
+          def _native_session_tick():
+              global _NATIVE_TIMER_RUNNING
+              if not _REGISTERED:
+                  _NATIVE_SESSIONS.clear()
+                  _disable_native_shift_snap()
+                  _NATIVE_TIMER_RUNNING = False
+                  return None
+
+              now = time.monotonic()
+              for pointer, record in tuple(_NATIVE_SESSIONS.items()):
+                  window = _window_by_ptr(pointer)
+                  if window is None:
+                      _NATIVE_SESSIONS.pop(pointer, None)
+                      continue
+                  alive = _native_rotate_alive(window)
+                  if alive:
+                      record["seen"] = True
+                      record["last_alive"] = now
+                      continue
+                  age = now - float(record.get("started", now))
+                  if bool(record.get("seen")) or age > 0.75:
+                      _NATIVE_SESSIONS.pop(pointer, None)
+
+              if not _NATIVE_SESSIONS:
+                  _disable_native_shift_snap()
+                  _NATIVE_TIMER_RUNNING = False
+                  state = _runtime_state()
+                  if state is not None:
+                      state["native_shift_snap_bridge"] = "IDLE"
+                  return None
+              return 0.03
+
+
+          def _ensure_native_session_timer():
+              global _NATIVE_TIMER_RUNNING
+              if _NATIVE_TIMER_RUNNING:
+                  return
+              _NATIVE_TIMER_RUNNING = True
+              try:
+                  bpy.app.timers.register(_native_session_tick, first_interval=0.02)
+              except Exception:
+                  _NATIVE_TIMER_RUNNING = False
+
+
+          '''
+              if helper_anchor not in n:
+                  raise SystemExit('navigation helper anchor missing')
+              n = n.replace(helper_anchor, helpers + helper_anchor, 1)
+
+          # Replace only the native rotate invoke; routing stays current V26.
+          istart = n.index('def _invoke_blender_rotate(target) -> bool:')
+          iend = n.index('\n\ndef try_native_navigation', istart)
+          invoke_new = '''def _invoke_blender_rotate(target) -> bool:
+              if target is None:
+                  return False
+              window, area, region = target
+              _enable_native_shift_snap()
+              pointer = _ptr(window)
+              try:
+                  with bpy.context.temp_override(window=window, area=area, region=region):
+                      result = bpy.ops.view3d.rotate("INVOKE_DEFAULT")
+                  running = "RUNNING_MODAL" in set(result or ())
+              except Exception as exc:
+                  running = False
+                  _set_status(f"Blender Native Rotate ERROR: {type(exc).__name__}: {exc}")
+
+              if not running:
+                  if not _NATIVE_SESSIONS:
+                      _disable_native_shift_snap()
+                  return False
+
+              _NATIVE_SESSIONS[pointer] = {
+                  "started": time.monotonic(),
+                  "last_alive": time.monotonic(),
+                  "seen": False,
+              }
+              _ensure_native_session_timer()
+              state = _runtime_state()
+              if state is not None:
+                  state["native_shift_snap_bridge"] = "ACTIVE"
+                  state.pop("native_shift_snap_error", None)
+              _set_status("Blender Native Rotate · Shift=Native Axis Snap")
+              return True
+          '''
+          n = n[:istart] + invoke_new + n[iend:]
+
+          # Make register/unregister clean up temporary modal items.
+          rstart = n.index('def register():')
+          ustart = n.index('\ndef unregister():', rstart)
+          rb = n[rstart:ustart]
+          if '_NATIVE_SESSIONS.clear()' not in rb:
+              rb = rb.replace(
+                  '    _REGISTERED = True\n',
+                  '    _REGISTERED = True\n    _NATIVE_SESSIONS.clear()\n    _disable_native_shift_snap()\n',
+                  1,
+              )
+              n = n[:rstart] + rb + n[ustart:]
+
+          ustart = n.index('def unregister():')
+          ub = n[ustart:]
+          if 'global _SHIFT_MODAL_KM' not in ub:
+              ub = ub.replace(
+                  '    global _REGISTERED, _CONFIGURED\n',
+                  '    global _REGISTERED, _CONFIGURED, _NATIVE_TIMER_RUNNING, _SHIFT_MODAL_KM\n',
+                  1,
+              )
+          if '_disable_native_shift_snap()' not in ub:
+              ub = ub.replace(
+                  '    _REGISTERED = False\n',
+                  '    _REGISTERED = False\n'
+                  '    _NATIVE_SESSIONS.clear()\n'
+                  '    _disable_native_shift_snap()\n'
+                  '    _SHIFT_MODAL_KM = None\n'
+                  '    _NATIVE_TIMER_RUNNING = False\n',
+                  1,
+              )
+          n = n[:ustart] + ub
+
+          compile(n, str(nav), 'exec')
+          nav.write_text(n, encoding='utf-8', newline='\n')
+
+          # ==============================================================
+          # Gates
+          # ==============================================================
+          assert 'pressed_preview = False' in v
+          assert 'imgui_arg.is_mouse_clicked(0)' in v
+          assert '_open_targeted_library(int(ident)' in v
+          assert '图标：打开笔刷库替换槽位' not in v
+
+          assert 'AXIS_SNAP_ENABLE' in n
+          assert 'AXIS_SNAP_DISABLE' in n
+          assert 'LEFT_SHIFT' in n and 'RIGHT_SHIFT' in n
+          assert '_native_rotate_alive' in n
+          assert '_disable_native_shift_snap()' in n
+          assert 'bpy.ops.view3d.rotate("INVOKE_DEFAULT")' in n
+
+          # Preserve V25 preview pipeline + V23a mask + Satellite fixes.
+          secondary = (work/'desktop/secondary_surface_host.py').read_text(encoding='utf-8')
+          mask = (work/'runtime/sculpt_mask_gesture.py').read_text(encoding='utf-8')
+          route = (work/'runtime/sculpt_route_truth.py').read_text(encoding='utf-8')
+          sat = (work/'desktop/satellite_host.py').read_text(encoding='utf-8')
+          sat_rt = (work/'desktop/satellite_host_runtime.py').read_text(encoding='utf-8')
+
+          assert 'on_request_preview=_request_brush_previews_exact' in secondary
+          assert '_BRUSH_PREVIEW_QUEUE_LIMIT = 4' in secondary
+          assert 'clean_age >= 0.18' in secondary
+          assert '_CLASSES = (LUMAFOLD_OT_sculpt_mask_gesture_v2,)' in mask
+          assert 'mask_feather_tap' in mask
+          assert 'mask_sharpen_tap' in mask
+          assert 'background_invert_tap' in mask
+          assert 'satellite_pointer_guard' in route
+          assert 'satellite_client_pointer_reprime' in sat
+          assert '_restore_blender_foreground_if_satellite_activated()' in sat
+          assert '_mirror_quick_shortcut_selection()' in sat
+          assert 'host_switch_hit_test(x, y)' in sat
+          assert 'if key == "brush_preview_cache":' in sat_rt
+
+          for py in work.rglob('*.py'):
+              compile(py.read_text(encoding='utf-8'), str(py), 'exec')
+
+          out.unlink(missing_ok=True)
+          with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+              for file in sorted(work.rglob('*')):
+                  if file.is_file():
+                      z.write(file, file.relative_to(work).as_posix())
+
+          digest = hashlib.sha256(out.read_bytes()).hexdigest()
+          out.with_suffix(out.suffix+'.sha256.txt').write_text(
+              f'{digest}  {out.name}\n', encoding='utf-8'
+          )
+          print('SHA256', digest)
+          '@ | Set-Content $py -Encoding UTF8
+          python $py
+
+      - name: Blender 5.2.0 and 5.2.2 extension validation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pkg = (Resolve-Path "$PWD/manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v27-first-click-shift-snap.zip").Path
+          foreach ($v in @('5.2.0','5.2.2')) {
+            $z = Join-Path $env:RUNNER_TEMP "blender-$v.zip"
+            $d = Join-Path $env:RUNNER_TEMP "blender-$v"
+            curl.exe -L --fail --retry 3 "https://download.blender.org/release/Blender5.2/blender-$v-windows-x64.zip" -o $z
+            if ($LASTEXITCODE -ne 0) { throw "Blender $v download failed" }
+            Expand-Archive $z $d -Force
+            $exe = Get-ChildItem $d -Filter blender.exe -Recurse | Select-Object -First 1
+            if (-not $exe) { throw "Blender $v executable missing" }
+            & $exe.FullName --command extension validate $pkg
+            if ($LASTEXITCODE -ne 0) { throw "Blender $v validation failed" }
+          }
+
+      - name: Publish
+        shell: pwsh
+        run: |
+          git config user.name 'LumaFold Build Bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v27-first-click-shift-snap.zip*
+          git commit -m "candidate: reliable first Quick Brush click and temporary Shift axis snap bridge"
+          git push origin HEAD:main
