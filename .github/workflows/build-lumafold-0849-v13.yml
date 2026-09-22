@@ -1,0 +1,126 @@
+name: Build LumaFold 0.8.49 V13
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build-lumafold-0849-v13.yml']
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch V12
+        shell: pwsh
+        run: |
+          $py = Join-Path $env:RUNNER_TEMP 'v13.py'
+          @'
+          import pathlib, zipfile, shutil, hashlib, os
+          root=pathlib.Path.cwd()
+          src=root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v12.zip'
+          out=root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v13.zip'
+          work=pathlib.Path(os.environ['RUNNER_TEMP'])/'lf_v13'
+          shutil.rmtree(work,ignore_errors=True); work.mkdir()
+          with zipfile.ZipFile(src) as z: z.extractall(work)
+
+          p=work/'ui/sculpt_interactions.py'
+          t=p.read_text(encoding='utf-8').replace('\r\n','\n')
+
+          old='''def _host_switch_button(imgui, scale: float, host_label: str, on_toggle_host):
+              satellite = str(host_label or "").strip() == "卫星"
+              name = "embedded" if satellite else "satellite"
+              tooltip = "返回 Blender 浮台" if satellite else "切换到卫星窗口"
+              clicked = control_icons.icon_button(
+                  imgui, name, "host_switch_b4", scale,
+                  box=24.0, glyph=15.0, selected=False, tooltip=tooltip,
+              )
+              if clicked and on_toggle_host is not None:
+                  on_toggle_host()
+              return bool(clicked)
+          '''
+          new='''def _host_switch_button(imgui, scale: float, host_label: str, on_toggle_host):
+              satellite = str(host_label or "").strip() == "卫星"
+              name = "embedded" if satellite else "satellite"
+              tooltip = "返回 Blender 浮台" if satellite else "切换到卫星窗口"
+              clicked = control_icons.icon_button(
+                  imgui, name, "host_switch_b4", scale,
+                  box=24.0, glyph=15.0, selected=False, tooltip=tooltip,
+              )
+
+              # Satellite -> Embedded must not depend on the button-release frame.
+              # The foreground keeper intentionally returns keyboard ownership to
+              # Blender, and after repeated host cycles Windows/ImGui can lose the
+              # release-side activation even though the press visibly landed.
+              # Commit this single host-switch action on the mouse-down edge while
+              # the item is hovered. Embedded -> Satellite keeps normal ImGui click.
+              pressed = False
+              if satellite:
+                  try:
+                      pressed = bool(imgui.is_item_hovered()) and bool(imgui.is_mouse_clicked(0))
+                  except Exception:
+                      pressed = False
+
+              activate = bool(pressed or clicked)
+              if activate and on_toggle_host is not None:
+                  on_toggle_host()
+              return activate
+          '''
+          if old not in t:
+              raise SystemExit('host switch interaction block not found')
+          t=t.replace(old,new,1)
+          compile(t,str(p),'exec')
+          p.write_text(t,encoding='utf-8',newline='\n')
+
+          # Preserve accepted V10/V11/V12 behavior.
+          host=(work/'desktop/satellite_host.py').read_text(encoding='utf-8')
+          rt=(work/'desktop/satellite_host_runtime.py').read_text(encoding='utf-8')
+          sec=(work/'desktop/secondary_surface_host_runtime.py').read_text(encoding='utf-8')
+          panels=(work/'panels.py').read_text(encoding='utf-8')
+          bridge=(work/'desktop/bridge_server.py').read_text(encoding='utf-8')
+          launcher=(work/'desktop/launcher.py').read_text(encoding='utf-8')
+          manifest=(work/'blender_manifest.toml').read_text(encoding='utf-8')
+
+          # First-stroke foreground fix stays at post-draw; no early restore in WM_MOUSEACTIVATE.
+          fn=host.index('def _wndproc_with_shortcut_capture')
+          ma=host.index('if int(msg) == WM_MOUSEACTIVATE',fn)
+          ma_return=host.index('return MA_NOACTIVATE',ma)
+          assert '_restore_blender_foreground_if_satellite_activated()' not in host[ma:ma_return]
+          assert 'result = _original_draw_frame()' in host
+          assert '_restore_blender_foreground_if_satellite_activated()' in host
+          assert '_mirror_quick_shortcut_selection()' in host
+
+          assert 'WS_EX_NOACTIVATE = 0x08000000' in rt
+          assert 'SW_SHOWNOACTIVATE' in rt
+          assert 'WS_EX_NOACTIVATE = 0x08000000' in sec
+          assert 'class LUMAFOLD_Preferences' in panels
+          assert 'satellite_client and command_id in {"sculpt.enter", "sculpt.exit_to_object"}' in bridge
+          assert '_active_slimgui_import_root' in launcher
+          assert 'wheels/slimgui-0.8.2-cp312-abi3-win_amd64.whl' in manifest
+
+          out.unlink(missing_ok=True)
+          with zipfile.ZipFile(out,'w',zipfile.ZIP_DEFLATED,compresslevel=9) as z:
+              for f in sorted(work.rglob('*')):
+                  if f.is_file(): z.write(f,f.relative_to(work).as_posix())
+          h=hashlib.sha256(out.read_bytes()).hexdigest()
+          out.with_suffix(out.suffix+'.sha256.txt').write_text(f'{h}  {out.name}\n',encoding='utf-8')
+          print(h)
+          '@ | Set-Content $py -Encoding UTF8
+          python $py
+      - name: Validate
+        shell: pwsh
+        run: |
+          $v='5.2.2'; $z="$env:RUNNER_TEMP\blender.zip"; $d="$env:RUNNER_TEMP\blender"
+          curl.exe -L --fail "https://download.blender.org/release/Blender5.2/blender-$v-windows-x64.zip" -o $z
+          Expand-Archive $z $d -Force
+          $exe=Get-ChildItem $d -Filter blender.exe -Recurse | Select-Object -First 1
+          & $exe.FullName --command extension validate "$PWD/manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v13.zip"
+          if ($LASTEXITCODE -ne 0) { throw 'validation failed' }
+      - name: Publish
+        shell: pwsh
+        run: |
+          git config user.name 'LumaFold Build Bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v13.zip*
+          git commit -m "candidate: trigger Satellite return on press edge"
+          git push origin HEAD:main
