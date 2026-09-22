@@ -60,36 +60,72 @@ jobs:
                   raise SystemExit('host hit-test insertion anchor missing')
               t = t.replace(anchor, anchor + helper, 1)
 
-          fn = t.index('def _host_switch_button(')
-          body_end = t.index('\ndef _draw_input_profile_switch', fn)
-          block = t[fn:body_end]
-          if 'global _HOST_SWITCH_RECT' not in block:
-              block = block.replace(
-                  'def _host_switch_button(imgui, scale: float, host_label: str, on_toggle_host):\n',
-                  'def _host_switch_button(imgui, scale: float, host_label: str, on_toggle_host):\n    global _HOST_SWITCH_RECT\n',
-                  1,
+          old_host = '''def _host_switch_button(imgui, scale: float, host_label: str, on_toggle_host):
+              satellite = str(host_label or "").strip() == "卫星"
+              name = "embedded" if satellite else "satellite"
+              tooltip = "返回 Blender 浮台" if satellite else "切换到卫星窗口"
+              clicked = control_icons.icon_button(
+                  imgui, name, "host_switch_b4", scale,
+                  box=24.0, glyph=15.0, selected=False, tooltip=tooltip,
               )
-          capture = '''    try:
-              rmin = imgui.get_item_rect_min()
-              rmax = imgui.get_item_rect_max()
-              _HOST_SWITCH_RECT = (
-                  float(rmin[0]), float(rmin[1]),
-                  float(rmax[0]), float(rmax[1]),
-              )
-          except Exception:
-              _HOST_SWITCH_RECT = None
+
+              # Satellite -> Embedded must not depend on the button-release frame.
+              # The foreground keeper intentionally returns keyboard ownership to
+              # Blender, and after repeated host cycles Windows/ImGui can lose the
+              # release-side activation even though the press visibly landed.
+              # Commit this single host-switch action on the mouse-down edge while
+              # the item is hovered. Embedded -> Satellite keeps normal ImGui click.
+              pressed = False
+              if satellite:
+                  try:
+                      pressed = bool(imgui.is_item_hovered()) and bool(imgui.is_mouse_clicked(0))
+                  except Exception:
+                      pressed = False
+
+              activate = bool(pressed or clicked)
+              if activate and on_toggle_host is not None:
+                  on_toggle_host()
+              return activate
           '''
-          if '_HOST_SWITCH_RECT = (' not in block:
-              needle = '    if clicked and on_toggle_host is not None:\n'
-              if needle not in block:
-                  # V13 has activate instead of the original clicked branch.
-                  needle = '    activate = bool(pressed or clicked)\n'
-                  if needle not in block:
-                      raise SystemExit('host switch post-button anchor missing')
-                  block = block.replace(needle, capture + '\n' + needle, 1)
-              else:
-                  block = block.replace(needle, capture + '\n' + needle, 1)
-          t = t[:fn] + block + t[body_end:]
+          new_host = '''def _host_switch_button(imgui, scale: float, host_label: str, on_toggle_host):
+              global _HOST_SWITCH_RECT
+              satellite = str(host_label or "").strip() == "卫星"
+              name = "embedded" if satellite else "satellite"
+              tooltip = "返回 Blender 浮台" if satellite else "切换到卫星窗口"
+              clicked = control_icons.icon_button(
+                  imgui, name, "host_switch_b4", scale,
+                  box=24.0, glyph=15.0, selected=False, tooltip=tooltip,
+              )
+
+              # Publish the exact client-local hit rectangle to the native Win32
+              # wrapper. Satellite -> Embedded can then commit on WM_LBUTTONDOWN
+              # without depending on ImGui focus/release state.
+              try:
+                  rmin = imgui.get_item_rect_min()
+                  rmax = imgui.get_item_rect_max()
+                  _HOST_SWITCH_RECT = (
+                      float(rmin[0]), float(rmin[1]),
+                      float(rmax[0]), float(rmax[1]),
+                  )
+              except Exception:
+                  _HOST_SWITCH_RECT = None
+
+              pressed = False
+              if satellite:
+                  try:
+                      pressed = bool(imgui.is_item_hovered()) and bool(imgui.is_mouse_clicked(0))
+                  except Exception:
+                      pressed = False
+
+              activate = bool(pressed or clicked)
+              if activate and on_toggle_host is not None:
+                  on_toggle_host()
+              return activate
+          '''
+          if old_host not in t:
+              raise SystemExit('V13 host switch block not found')
+          t = t.replace(old_host, new_host, 1)
+
           compile(t, str(interactions), 'exec')
           interactions.write_text(t, encoding='utf-8', newline='\n')
 
