@@ -48,22 +48,24 @@ jobs:
                   1,
               )
 
-          old_open = '''    def _open_product_secondary(kind, anchor=None):
-              return _secondary_session.open_surface(_runtime, kind, anchor)
-          '''
-          new_open = '''    def _open_product_secondary(kind, anchor=None):
-              global _last_target_sent
-              if str(kind or "") == "brush_library":
-                  # The Secondary child keeps the targeted slot until the
-                  # primary explicitly changes/clears it. Force a resend on
-                  # every targeted open, including reopening the same slot.
-                  _last_target_sent = None
-              return _secondary_session.open_surface(_runtime, kind, anchor)
-          '''
-          if old_open in h:
-              h = h.replace(old_open, new_open, 1)
-          elif new_open not in h:
-              raise SystemExit('product secondary open wrapper missing')
+          open_start = h.index('    def _open_product_secondary(kind, anchor=None):')
+          open_end = h.index('\n\n    def _open_more_secondary', open_start)
+          open_block = h[open_start:open_end]
+          if 'global _last_target_sent' not in open_block:
+              def_line = '    def _open_product_secondary(kind, anchor=None):\n'
+              if def_line not in open_block:
+                  raise SystemExit('product secondary open function header missing')
+              open_block = open_block.replace(
+                  def_line,
+                  def_line
+                  + '        global _last_target_sent\n'
+                  + '        if str(kind or "") == "brush_library":\n'
+                  + '            # Force the target slot to be resent on every open,\n'
+                  + '            # including reopening the same Quick Brush tile.\n'
+                  + '            _last_target_sent = None\n',
+                  1,
+              )
+              h = h[:open_start] + open_block + h[open_end:]
 
           if 'def _sync_brush_visual_state_while_library_open():' not in h:
               anchor = 'def _draw_frame_with_popup_dismiss():\n'
