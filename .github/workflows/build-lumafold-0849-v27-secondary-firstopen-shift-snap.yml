@@ -1,0 +1,273 @@
+name: Build LumaFold 0.8.49 V27 Secondary First Open + Shift Snap
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build-lumafold-0849-v27-secondary-firstopen-shift-snap.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch V26
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $py = Join-Path $env:RUNNER_TEMP 'v27.py'
+          @'
+          import pathlib, zipfile, shutil, hashlib, os
+
+          root = pathlib.Path.cwd()
+          src = root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v26-quickbrush-click.zip'
+          out = root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v27-secondary-firstopen-shift-snap.zip'
+          work = pathlib.Path(os.environ['RUNNER_TEMP'])/'lf_v27'
+          shutil.rmtree(work, ignore_errors=True)
+          work.mkdir(parents=True)
+          with zipfile.ZipFile(src) as z:
+              z.extractall(work)
+
+          # ==============================================================
+          # 1) Satellite Secondary first-click reliability.
+          #
+          # Cold child launch is async. Keep the original pending OPEN intent
+          # alive until Windows confirms the child is visible. Also make the
+          # runtime same-kind path idempotent, matching product OPEN semantics,
+          # so retries can never become open->hide toggles.
+          # ==============================================================
+          runtime = work/'desktop/satellite_host_runtime.py'
+          r = runtime.read_text(encoding='utf-8').replace('\r\n','\n')
+
+          toggle_start = r.index('def _toggle_secondary_surface(')
+          toggle_end = r.index('\n\ndef _point_in_rect', toggle_start)
+          tb = r[toggle_start:toggle_end]
+
+          old_visible = (
+              '    is_visible = bool(user32.IsWindowVisible(hwnd))\n'
+              '    if is_visible and secondary_kind == kind:\n'
+              '        _hide_secondary_surface()\n'
+              '        return proc\n'
+          )
+          new_visible = (
+              '    is_visible = bool(user32.IsWindowVisible(hwnd))\n'
+              '    if is_visible and secondary_kind == kind:\n'
+              '        # Product controls express OPEN intent. A retry caused by\n'
+              '        # cold child startup must never turn into an accidental hide.\n'
+              '        return proc\n'
+          )
+          if old_visible in tb:
+              tb = tb.replace(old_visible, new_visible, 1)
+          elif 'accidental hide' not in tb:
+              raise SystemExit('secondary same-kind toggle block missing')
+
+          # Do not consume the cold-start pending intent before visibility is confirmed.
+          tb = tb.replace('    secondary_pending_request = None\n    secondary_hwnd = hwnd\n', '    secondary_hwnd = hwnd\n', 1)
+          r = r[:toggle_start] + tb + r[toggle_end:]
+
+          flush_start = r.index('def _flush_secondary_pending_request():')
+          flush_end = r.index('\n\ndef _draw_frame', flush_start)
+          new_flush = (
+              'def _flush_secondary_pending_request():\n'
+              '    global secondary_pending_request\n'
+              '    pending = secondary_pending_request\n'
+              '    if not pending:\n'
+              '        return\n'
+              '    proc, hwnd = _ensure_secondary_surface(wait=False)\n'
+              '    if proc is None or hwnd is None:\n'
+              '        return\n'
+              '    kind, anchor = pending\n'
+              '    _toggle_secondary_surface(kind, anchor)\n'
+              '    # ShowWindowAsync is intentionally non-blocking. Keep retrying the\n'
+              '    # same idempotent OPEN intent until Windows confirms visibility.\n'
+              '    try:\n'
+              '        visible_now = bool(user32.IsWindowVisible(hwnd))\n'
+              '    except Exception:\n'
+              '        visible_now = False\n'
+              '    if visible_now and str(secondary_kind or "") == str(kind or ""):\n'
+              '        secondary_pending_request = None\n'
+              '\n'
+          )
+          r = r[:flush_start] + new_flush + r[flush_end:]
+          compile(r, str(runtime), 'exec')
+          runtime.write_text(r, encoding='utf-8', newline='\n')
+
+          # ==============================================================
+          # 2) LumaFold-only Shift view snap.
+          #
+          # Blender 5.2's native "View3D Rotate Modal" maps Alt press/release to
+          # AXIS_SNAP_ENABLE/DISABLE. Do not mutate Blender user/default keymaps.
+          # Add the equivalent Shift bindings only in keyconfigs.addon, and remove
+          # them when LumaFold unregisters. Native VIEW3D_OT_rotate still owns all
+          # actual rotation and snapping math.
+          # ==============================================================
+          nav = work/'runtime/sculpt_navigation.py'
+          n = nav.read_text(encoding='utf-8').replace('\r\n','\n')
+
+          if '_ADDON_KEYMAPS = []' not in n:
+              anchor = '_REGISTERED = False\n'
+              if anchor not in n:
+                  raise SystemExit('navigation registration globals anchor missing')
+              n = n.replace(anchor, anchor + '_ADDON_KEYMAPS = []\n', 1)
+
+          if 'def _register_shift_axis_snap_keymap():' not in n:
+              anchor = 'def _runtime_state():\n'
+              helper = (
+                  'def _unregister_shift_axis_snap_keymap():\n'
+                  '    while _ADDON_KEYMAPS:\n'
+                  '        km, kmi = _ADDON_KEYMAPS.pop()\n'
+                  '        try:\n'
+                  '            km.keymap_items.remove(kmi)\n'
+                  '        except Exception:\n'
+                  '            pass\n'
+                  '\n'
+                  '\n'
+                  'def _register_shift_axis_snap_keymap():\n'
+                  '    """Map Shift to Blender native Rotate Modal axis-snap via add-on keyconfig only."""\n'
+                  '    _unregister_shift_axis_snap_keymap()\n'
+                  '    try:\n'
+                  '        wm = bpy.context.window_manager\n'
+                  '        kc = wm.keyconfigs.addon\n'
+                  '    except Exception:\n'
+                  '        kc = None\n'
+                  '    if kc is None:\n'
+                  '        return\n'
+                  '    try:\n'
+                  '        km = kc.keymaps.new(\n'
+                  '            name="View3D Rotate Modal",\n'
+                  '            space_type="EMPTY", region_type="WINDOW", modal=True,\n'
+                  '        )\n'
+                  '        bindings = (\n'
+                  '            ("AXIS_SNAP_ENABLE", "LEFT_SHIFT", "PRESS"),\n'
+                  '            ("AXIS_SNAP_DISABLE", "LEFT_SHIFT", "RELEASE"),\n'
+                  '            ("AXIS_SNAP_ENABLE", "RIGHT_SHIFT", "PRESS"),\n'
+                  '            ("AXIS_SNAP_DISABLE", "RIGHT_SHIFT", "RELEASE"),\n'
+                  '        )\n'
+                  '        for modal_value, event_type, event_value in bindings:\n'
+                  '            kmi = km.keymap_items.new_modal(\n'
+                  '                modal_value, event_type, event_value, any=True\n'
+                  '            )\n'
+                  '            _ADDON_KEYMAPS.append((km, kmi))\n'
+                  '    except Exception:\n'
+                  '        _unregister_shift_axis_snap_keymap()\n'
+                  '\n'
+                  '\n'
+              )
+              if anchor not in n:
+                  raise SystemExit('navigation helper insertion anchor missing')
+              n = n.replace(anchor, helper + anchor, 1)
+
+          reg_start = n.index('def register():')
+          reg_end = n.index('\n\ndef unregister():', reg_start)
+          reg = n[reg_start:reg_end]
+          if '_register_shift_axis_snap_keymap()' not in reg:
+              marker = '    _base.register()\n'
+              if marker not in reg:
+                  raise SystemExit('navigation register base call missing')
+              reg = reg.replace(marker, marker + '    _register_shift_axis_snap_keymap()\n', 1)
+              n = n[:reg_start] + reg + n[reg_end:]
+
+          unreg_start = n.index('def unregister():')
+          ub = n[unreg_start:]
+          if '_unregister_shift_axis_snap_keymap()' not in ub:
+              marker = '    _REGISTERED = False\n'
+              if marker not in ub:
+                  raise SystemExit('navigation unregister marker missing')
+              ub = ub.replace(marker, marker + '    _unregister_shift_axis_snap_keymap()\n', 1)
+              n = n[:unreg_start] + ub
+
+          compile(n, str(nav), 'exec')
+          nav.write_text(n, encoding='utf-8', newline='\n')
+
+          # ==============================================================
+          # Regression gates.
+          # ==============================================================
+          view = (work/'ui/sculpt_view.py').read_text(encoding='utf-8')
+          secondary = (work/'desktop/secondary_surface_host.py').read_text(encoding='utf-8')
+          mask = (work/'runtime/sculpt_mask_gesture.py').read_text(encoding='utf-8')
+          route = (work/'runtime/sculpt_route_truth.py').read_text(encoding='utf-8')
+          sat = (work/'desktop/satellite_host.py').read_text(encoding='utf-8')
+          sat_rt = (work/'desktop/satellite_host_runtime.py').read_text(encoding='utf-8')
+
+          # New behavior.
+          assert 'accidental hide' in r
+          assert 'visible_now and str(secondary_kind or "") == str(kind or "")' in r
+          assert 'name="View3D Rotate Modal"' in n
+          assert 'AXIS_SNAP_ENABLE' in n
+          assert 'LEFT_SHIFT' in n and 'RIGHT_SHIFT' in n
+          assert 'wm.keyconfigs.addon' in n
+          assert '_unregister_shift_axis_snap_keymap()' in n
+
+          # Do not touch Blender user/default keyconfigs.
+          assert 'keyconfigs.user' not in n
+          assert 'keyconfigs.default' not in n
+
+          # Preserve V26 Quick Brush behavior.
+          quick_start = view.index('    def _quick_widget(')
+          quick_end = view.index('\n    def _button_product', quick_start)
+          quick = view[quick_start:quick_end]
+          assert 'if clicked_preview:' in quick
+          assert 'return True' in quick[quick.index('if clicked_preview:'):]
+          assert '图标：打开笔刷库替换槽位' not in view
+
+          # Preserve V25 preview reliability and prior accepted fixes.
+          assert 'on_request_preview=_request_brush_previews_exact' in secondary
+          assert '_BRUSH_PREVIEW_QUEUE_LIMIT = 4' in secondary
+          assert 'clean_age >= 0.18' in secondary
+          assert '_CLASSES = (LUMAFOLD_OT_sculpt_mask_gesture_v2,)' in mask
+          assert 'mask_feather_tap' in mask
+          assert 'mask_sharpen_tap' in mask
+          assert 'background_invert_tap' in mask
+          assert 'satellite_pointer_guard' in route
+          assert 'satellite_client_pointer_reprime' in sat
+          assert '_restore_blender_foreground_if_satellite_activated()' in sat
+          assert '_mirror_quick_shortcut_selection()' in sat
+          assert 'host_switch_hit_test(x, y)' in sat
+          assert 'if key == "brush_preview_cache":' in sat_rt
+
+          for py in work.rglob('*.py'):
+              compile(py.read_text(encoding='utf-8'), str(py), 'exec')
+
+          out.unlink(missing_ok=True)
+          with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+              for file in sorted(work.rglob('*')):
+                  if file.is_file():
+                      z.write(file, file.relative_to(work).as_posix())
+
+          digest = hashlib.sha256(out.read_bytes()).hexdigest()
+          out.with_suffix(out.suffix+'.sha256.txt').write_text(
+              f'{digest}  {out.name}\n', encoding='utf-8'
+          )
+          print('SHA256', digest)
+          '@ | Set-Content $py -Encoding UTF8
+          python $py
+
+      - name: Blender 5.2.0 and 5.2.2 extension validation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pkg = (Resolve-Path "$PWD/manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v27-secondary-firstopen-shift-snap.zip").Path
+          foreach ($v in @('5.2.0','5.2.2')) {
+            $z = Join-Path $env:RUNNER_TEMP "blender-$v.zip"
+            $d = Join-Path $env:RUNNER_TEMP "blender-$v"
+            curl.exe -L --fail --retry 3 "https://download.blender.org/release/Blender5.2/blender-$v-windows-x64.zip" -o $z
+            if ($LASTEXITCODE -ne 0) { throw "Blender $v download failed" }
+            Expand-Archive $z $d -Force
+            $exe = Get-ChildItem $d -Filter blender.exe -Recurse | Select-Object -First 1
+            if (-not $exe) { throw "Blender $v executable missing" }
+            & $exe.FullName --command extension validate $pkg
+            if ($LASTEXITCODE -ne 0) { throw "Blender $v validation failed" }
+          }
+
+      - name: Publish
+        shell: pwsh
+        run: |
+          git config user.name 'LumaFold Build Bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v27-secondary-firstopen-shift-snap.zip*
+          git commit -m "candidate: reliable first Secondary open and native Shift axis snap"
+          git push origin HEAD:main
