@@ -46,48 +46,30 @@ jobs:
           qend = v.index('\n    def _button_product', qstart)
           qb = v[qstart:qend]
 
-          old_head = '''        clicked = _visual_quick_slot_widget(
-              imgui_arg, sculpt, label, ident, scale_arg, width_px, selected, empty, tex_id,
+          marker = '        if not clicked or bool(empty):\n            return bool(clicked)\n'
+          if marker not in qb:
+              raise SystemExit('V26 Quick Brush clicked gate not found')
+          press_block = (
+              '        # Satellite is WS_EX_NOACTIVATE. On the first interaction Windows can\n'
+              '        # deliver the press reliably while ImGui\'s release-side Click arrives\n'
+              '        # only after pointer-focus repair. Detect the preview press edge here\n'
+              '        # so one physical click always opens the library.\n'
+              '        pressed_preview = False\n'
+              '        try:\n'
+              '            if not bool(empty) and bool(imgui_arg.is_item_hovered()) and bool(imgui_arg.is_mouse_clicked(0)):\n'
+              '                rmax_press = imgui_arg.get_item_rect_max()\n'
+              '                mouse_press = imgui_arg.get_mouse_pos()\n'
+              '                name_top_press = float(rmax_press[1]) - px(15.0, scale_arg)\n'
+              '                pressed_preview = float(mouse_press[1]) < name_top_press\n'
+              '        except Exception:\n'
+              '            pressed_preview = False\n'
+              '\n'
+              '        if pressed_preview:\n'
+              '            _open_targeted_library(int(ident), _foundation._item_anchor(imgui_arg, scale_arg))\n'
+              '            return True\n'
+              '\n'
           )
-              if not clicked or bool(empty):
-                  return bool(clicked)
-          '''
-          # V26 keeps the same visual widget but may differ only in comments.
-          if old_head not in qb:
-              old_head = '''        clicked = _visual_quick_slot_widget(
-              imgui_arg, sculpt, label, ident, scale_arg, width_px, selected, empty, tex_id,
-          )
-          if not clicked or bool(empty):
-              return bool(clicked)
-          '''
-          new_head = '''        clicked = _visual_quick_slot_widget(
-              imgui_arg, sculpt, label, ident, scale_arg, width_px, selected, empty, tex_id,
-          )
-
-          # Satellite is WS_EX_NOACTIVATE. On the first interaction Windows can
-          # deliver the press reliably while ImGui's release-side Click arrives
-          # only after pointer-focus repair. Detect the preview press edge here
-          # so one physical click always opens the library.
-          pressed_preview = False
-          try:
-              if not bool(empty) and bool(imgui_arg.is_item_hovered()) and bool(imgui_arg.is_mouse_clicked(0)):
-                  rmax_press = imgui_arg.get_item_rect_max()
-                  mouse_press = imgui_arg.get_mouse_pos()
-                  name_top_press = float(rmax_press[1]) - px(15.0, scale_arg)
-                  pressed_preview = float(mouse_press[1]) < name_top_press
-          except Exception:
-              pressed_preview = False
-
-          if pressed_preview:
-              _open_targeted_library(int(ident), _foundation._item_anchor(imgui_arg, scale_arg))
-              return True
-
-          if not clicked or bool(empty):
-              return bool(clicked)
-          '''
-          if old_head not in qb:
-              raise SystemExit('V26 Quick Brush widget head not found')
-          qb = qb.replace(old_head, new_head, 1)
+          qb = qb.replace(marker, press_block + marker, 1)
           v = v[:qstart] + qb + v[qend:]
 
           compile(v, str(view), 'exec')
