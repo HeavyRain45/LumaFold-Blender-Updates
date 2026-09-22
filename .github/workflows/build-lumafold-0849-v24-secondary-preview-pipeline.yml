@@ -1,0 +1,388 @@
+name: Build LumaFold 0.8.49 V24 Secondary Preview Pipeline
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build-lumafold-0849-v24-secondary-preview-pipeline.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch V23a Secondary Brush preview pipeline
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $py = Join-Path $env:RUNNER_TEMP 'v24.py'
+          @'
+          import pathlib, zipfile, shutil, hashlib, os
+
+          root = pathlib.Path.cwd()
+          src = root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v23a-mask-tap-satellite-hitguard.zip'
+          out = root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v24-secondary-preview-pipeline.zip'
+          work = pathlib.Path(os.environ['RUNNER_TEMP'])/'lf_v24'
+          shutil.rmtree(work, ignore_errors=True)
+          work.mkdir(parents=True)
+          with zipfile.ZipFile(src) as z:
+              z.extractall(work)
+
+          # ==============================================================
+          # ROOT CAUSE
+          # V16 intentionally removed the Secondary's 120ms full get_state
+          # watchdog to protect Blender input latency. The shared gallery still
+          # marks up to 16 visible preview identities as "requested", but the
+          # preview scheduler only completes a tiny synchronous foreground chunk
+          # and queues the rest. With no idle snapshot polling, those later
+          # completions have no transport event back to the Secondary child.
+          # Result: slow thumbnails and sometimes permanently blank tiles.
+          #
+          # V24 gives Secondary a dedicated exact preview-delta action:
+          # - no full Blender snapshot;
+          # - exact requested identities, max 4 per request;
+          # - current Core cache is consulted first;
+          # - Blender preview extraction only for true misses;
+          # - response merges into the existing Secondary snapshot;
+          # - at most 8 preview identities may be in flight.
+          # ==============================================================
+
+          # --------------------------------------------------------------
+          # A) Blender Bridge: exact lightweight preview delta.
+          # --------------------------------------------------------------
+          bridge = work/'desktop/bridge_server.py'
+          b = bridge.read_text(encoding='utf-8').replace('\r\n','\n')
+
+          if 'def _brush_preview_delta(self, identities):' not in b:
+              process_anchor = '    def _process(self, payload: Dict[str, Any]) -> Dict[str, Any]:\n'
+              helper = (
+                  '    def _brush_preview_delta(self, identities):\n'
+                  '        """Return exact Brush preview payloads without a full snapshot."""\n'
+                  '        requested = []\n'
+                  '        for raw in list(identities or ()):\n'
+                  '            identity = str(raw or "")\n'
+                  '            if identity and identity not in requested:\n'
+                  '                requested.append(identity)\n'
+                  '            if len(requested) >= 4:\n'
+                  '                break\n'
+                  '        if not requested:\n'
+                  '            return {}, []\n'
+                  '\n'
+                  '        state = APP.store.namespace("sculpt")\n'
+                  '        primary = dict(state.get("primary_brush_preview_cache") or {})\n'
+                  '        legacy = dict(state.get("brush_library_preview_cache") or {})\n'
+                  '        delta = {}\n'
+                  '        missing = []\n'
+                  '        assets = {\n'
+                  '            str((item or {}).get("identity") or ""): dict(item or {})\n'
+                  '            for item in list(state.get("brush_library_assets") or ())\n'
+                  '            if str((item or {}).get("identity") or "")\n'
+                  '        }\n'
+                  '\n'
+                  '        for identity in requested:\n'
+                  '            payload = dict(primary.get(identity) or legacy.get(identity) or {})\n'
+                  '            if payload.get("rgba_b64"):\n'
+                  '                payload["key"] = identity\n'
+                  '                delta[identity] = payload\n'
+                  '            elif identity in assets:\n'
+                  '                missing.append(assets[identity])\n'
+                  '\n'
+                  '        if missing:\n'
+                  '            try:\n'
+                  '                service = APP.services.require("blender.brush")\n'
+                  '                loaded = dict(service.brush_asset_previews(missing, max_edge=64) or {})\n'
+                  '            except Exception:\n'
+                  '                loaded = {}\n'
+                  '            for identity, raw in loaded.items():\n'
+                  '                identity = str(identity or "")\n'
+                  '                payload = dict(raw or {})\n'
+                  '                if identity and payload.get("rgba_b64"):\n'
+                  '                    payload["key"] = identity\n'
+                  '                    delta[identity] = payload\n'
+                  '\n'
+                  '        # Keep Core CPU residency bounded. 128 comfortably covers\n'
+                  '        # Blender Essentials today plus a useful local-library window.\n'
+                  '        for key in ("primary_brush_preview_cache", "brush_library_preview_cache"):\n'
+                  '            cache = state.setdefault(key, {})\n'
+                  '            for identity, payload in delta.items():\n'
+                  '                cache[identity] = dict(payload)\n'
+                  '            while len(cache) > 128:\n'
+                  '                cache.pop(next(iter(cache)), None)\n'
+                  '        return delta, requested\n'
+                  '\n'
+                  '\n'
+              )
+              if process_anchor not in b:
+                  raise SystemExit('bridge _process anchor missing')
+              b = b.replace(process_anchor, helper + process_anchor, 1)
+
+          process_start = b.index('    def _process(self, payload: Dict[str, Any]) -> Dict[str, Any]:')
+          process_end = b.index('\n    def _pump_main_thread', process_start)
+          pb = b[process_start:process_end]
+          if 'action == "get_brush_preview_delta"' not in pb:
+              marker = '        if action in {"ping", "get_state"}:\n'
+              action_block = (
+                  '        if action == "get_brush_preview_delta":\n'
+                  '            delta, requested = self._brush_preview_delta(payload.get("identities") or ())\n'
+                  '            return {\n'
+                  '                "ok": True,\n'
+                  '                "preview_delta": delta,\n'
+                  '                "requested": requested,\n'
+                  '            }\n'
+              )
+              if marker not in pb:
+                  raise SystemExit('bridge action insertion marker missing')
+              pb = pb.replace(marker, action_block + marker, 1)
+              b = b[:process_start] + pb + b[process_end:]
+
+          compile(b, str(bridge), 'exec')
+          bridge.write_text(b, encoding='utf-8', newline='\n')
+
+          # --------------------------------------------------------------
+          # B) Secondary child: bounded exact requests + delta merge.
+          # --------------------------------------------------------------
+          secondary = work/'desktop/secondary_surface_host.py'
+          s = secondary.read_text(encoding='utf-8').replace('\r\n','\n')
+
+          global_anchor = '_stable_brush_previews = {}\n_stable_alpha_previews = {}\n'
+          preview_globals = (
+              '_stable_brush_previews = {}\n'
+              '_stable_alpha_previews = {}\n'
+              '_preview_inflight = set()\n'
+              '_preview_retry_after = {}\n'
+              '_PREVIEW_BATCH = 4\n'
+              '_PREVIEW_MAX_INFLIGHT = 8\n'
+              '_PREVIEW_RETRY_SECONDS = 0.70\n'
+          )
+          if '_PREVIEW_MAX_INFLIGHT = 8' not in s:
+              if global_anchor not in s:
+                  raise SystemExit('Secondary preview globals anchor missing')
+              s = s.replace(global_anchor, preview_globals, 1)
+
+          if 'def _request_brush_preview_delta(identities):' not in s:
+              anchor = 'def _button_state(vk):\n'
+              helper = (
+                  'def _request_brush_preview_delta(identities):\n'
+                  '    """Queue only exact visible Brush previews; never a full snapshot."""\n'
+                  '    requested_map = _runtime.library_ui_state.setdefault("brush_preview_requested", {})\n'
+                  '    now = _runtime.time.monotonic()\n'
+                  '    ids = []\n'
+                  '    for raw in list(identities or ()):\n'
+                  '        identity = str(raw or "")\n'
+                  '        if identity and identity not in ids:\n'
+                  '            ids.append(identity)\n'
+                  '\n'
+                  '    capacity = max(0, int(_PREVIEW_MAX_INFLIGHT) - len(_preview_inflight))\n'
+                  '    batch = []\n'
+                  '    for identity in ids:\n'
+                  '        if identity in _preview_inflight:\n'
+                  '            continue\n'
+                  '        if now < float(_preview_retry_after.get(identity, 0.0) or 0.0):\n'
+                  '            requested_map.pop(identity, None)\n'
+                  '            continue\n'
+                  '        if len(batch) < min(int(_PREVIEW_BATCH), capacity):\n'
+                  '            batch.append(identity)\n'
+                  '        else:\n'
+                  '            # Shared gallery pre-marks up to 16 ids. Release ids\n'
+                  '            # we did not enqueue so the next frame can offer them.\n'
+                  '            requested_map.pop(identity, None)\n'
+                  '\n'
+                  '    if not batch:\n'
+                  '        return\n'
+                  '    _preview_inflight.update(batch)\n'
+                  '    try:\n'
+                  '        _runtime.actions.put_nowait({\n'
+                  '            "action": "get_brush_preview_delta",\n'
+                  '            "identities": list(batch),\n'
+                  '        })\n'
+                  '    except Exception:\n'
+                  '        for identity in batch:\n'
+                  '            _preview_inflight.discard(identity)\n'
+                  '            requested_map.pop(identity, None)\n'
+                  '\n'
+                  '\n'
+                  'def _merge_brush_preview_delta(response, payload):\n'
+                  '    delta = dict(response.get("preview_delta") or {})\n'
+                  '    requested = [str(x) for x in list(payload.get("identities") or ()) if str(x or "")]\n'
+                  '    now = _runtime.time.monotonic()\n'
+                  '    requested_map = _runtime.library_ui_state.setdefault("brush_preview_requested", {})\n'
+                  '\n'
+                  '    with _runtime.state_lock:\n'
+                  '        snapshot = dict(_runtime.bridge_state or {})\n'
+                  '        module_state = dict(snapshot.get("module_state") or {})\n'
+                  '        sculpt = dict(module_state.get("sculpt") or {})\n'
+                  '        cache = dict(sculpt.get("brush_library_preview_cache") or {})\n'
+                  '        for identity, raw in delta.items():\n'
+                  '            payload_preview = dict(raw or {})\n'
+                  '            if payload_preview.get("rgba_b64"):\n'
+                  '                payload_preview["key"] = str(identity)\n'
+                  '                cache[str(identity)] = payload_preview\n'
+                  '        while len(cache) > 128:\n'
+                  '            cache.pop(next(iter(cache)), None)\n'
+                  '        sculpt["brush_library_preview_cache"] = cache\n'
+                  '        module_state["sculpt"] = sculpt\n'
+                  '        snapshot["module_state"] = module_state\n'
+                  '        _runtime.bridge_state = snapshot\n'
+                  '\n'
+                  '    for identity in requested:\n'
+                  '        _preview_inflight.discard(identity)\n'
+                  '        requested_map.pop(identity, None)\n'
+                  '        if identity in delta:\n'
+                  '            _preview_retry_after.pop(identity, None)\n'
+                  '        else:\n'
+                  '            _preview_retry_after[identity] = now + float(_PREVIEW_RETRY_SECONDS)\n'
+                  '\n'
+                  '\n'
+              )
+              if anchor not in s:
+                  raise SystemExit('Secondary helper insertion anchor missing')
+              s = s.replace(anchor, helper + anchor, 1)
+
+          # Inject delta handling into the V16 event-driven worker.
+          nw_start = s.index('def _network_worker_watchdog():')
+          nw_end = s.index('\n\n_runtime._network_worker = _network_worker_watchdog', nw_start)
+          nw = s[nw_start:nw_end]
+          if '_merge_brush_preview_delta(response, payload)' not in nw:
+              marker = '            if response.get("ok") and isinstance(response.get("state"), dict):\n'
+              delta_block = (
+                  '            if (\n'
+                  '                bool(response.get("ok"))\n'
+                  '                and str(payload.get("action") or "") == "get_brush_preview_delta"\n'
+                  '            ):\n'
+                  '                _merge_brush_preview_delta(response, payload)\n'
+                  '\n'
+              )
+              if marker not in nw:
+                  raise SystemExit('Secondary worker response marker missing')
+              nw = nw.replace(marker, delta_block + marker, 1)
+              s = s[:nw_start] + nw + s[nw_end:]
+
+          # Use the exact delta action instead of the asynchronous shared preview command.
+          old_cb = 'on_request_preview=lambda identities: _queue_command("sculpt.brush.library_preview", identities=list(identities or ())),'
+          new_cb = 'on_request_preview=_request_brush_preview_delta,'
+          if old_cb in s:
+              s = s.replace(old_cb, new_cb, 1)
+          elif new_cb not in s:
+              raise SystemExit('Secondary Brush preview callback not found')
+
+          # Bound the child-side stable CPU payload cache.
+          s = s.replace(
+              'sculpt["brush_library_preview_cache"] = _merge_cache(_stable_brush_previews, brush, 192)',
+              'sculpt["brush_library_preview_cache"] = _merge_cache(_stable_brush_previews, brush, 128)',
+          )
+          s = s.replace(
+              'sculpt["alpha_library_preview_cache"] = _merge_cache(_stable_alpha_previews, alpha, 128)',
+              'sculpt["alpha_library_preview_cache"] = _merge_cache(_stable_alpha_previews, alpha, 96)',
+          )
+
+          compile(s, str(secondary), 'exec')
+          secondary.write_text(s, encoding='utf-8', newline='\n')
+
+          # --------------------------------------------------------------
+          # C) GPU + Blender native thumbnail residency bounds.
+          # Primary Host default 256 remains unchanged; only low explicit host
+          # requests can now settle at 96 instead of being forced to 192.
+          # --------------------------------------------------------------
+          textures = work/'ui/preview_textures.py'
+          p = textures.read_text(encoding='utf-8').replace('\r\n','\n')
+          old_floor = 'self.max_items = max(192, int(max_items))'
+          new_floor = 'self.max_items = max(96, int(max_items))'
+          if old_floor in p:
+              p = p.replace(old_floor, new_floor, 1)
+          elif new_floor not in p:
+              raise SystemExit('PreviewTextureCache residency floor not found')
+          compile(p, str(textures), 'exec')
+          textures.write_text(p, encoding='utf-8', newline='\n')
+
+          residency = work/'runtime/brush_preview_residency.py'
+          q = residency.read_text(encoding='utf-8').replace('\r\n','\n')
+          if '_MAX_NATIVE_ITEMS = 192' in q:
+              q = q.replace('_MAX_NATIVE_ITEMS = 192', '_MAX_NATIVE_ITEMS = 128', 1)
+          elif '_MAX_NATIVE_ITEMS = 128' not in q:
+              raise SystemExit('native Brush preview residency bound not found')
+          compile(q, str(residency), 'exec')
+          residency.write_text(q, encoding='utf-8', newline='\n')
+
+          # ==============================================================
+          # Regression + memory gates.
+          # ==============================================================
+          mask = (work/'runtime/sculpt_mask_gesture.py').read_text(encoding='utf-8')
+          route = (work/'runtime/sculpt_route_truth.py').read_text(encoding='utf-8')
+          sat = (work/'desktop/satellite_host.py').read_text(encoding='utf-8')
+          sat_rt = (work/'desktop/satellite_host_runtime.py').read_text(encoding='utf-8')
+
+          assert 'def _brush_preview_delta(self, identities):' in b
+          assert 'action == "get_brush_preview_delta"' in b
+          assert 'on_request_preview=_request_brush_preview_delta' in s
+          assert '_PREVIEW_MAX_INFLIGHT = 8' in s
+          assert 'while len(cache) > 128:' in s
+          worker = s[s.index('def _network_worker_watchdog'):s.index('_runtime._network_worker = _network_worker_watchdog')]
+          assert 'payload = {"action": "get_state"}' not in worker
+          assert '_merge_brush_preview_delta(response, payload)' in worker
+          assert 'self.max_items = max(96, int(max_items))' in p
+          assert '_MAX_NATIVE_ITEMS = 128' in q
+
+          # Keep V23a Mask and Satellite pointer protections.
+          assert '_CLASSES = (LUMAFOLD_OT_sculpt_mask_gesture_v2,)' in mask
+          assert 'mask_feather_tap' in mask
+          assert 'mask_sharpen_tap' in mask
+          assert 'background_invert_tap' in mask
+          assert 'satellite_pointer_guard' in route
+          assert 'satellite_client_pointer_reprime' in sat
+          assert '_restore_blender_foreground_if_satellite_activated()' in sat
+          assert 'if key == "brush_preview_cache":' in sat_rt
+
+          # Rough bounded payload math for CI visibility (64x64 RGBA8):
+          rgba = 64 * 64 * 4
+          b64 = ((rgba + 2) // 3) * 4
+          print('SECONDARY_CPU_BRUSH_B64_MAX_MIB', round(128 * b64 / 1024 / 1024, 2))
+          print('SECONDARY_GPU_RGBA_MAX_MIB', round(96 * rgba / 1024 / 1024, 2))
+          print('BLENDER_NATIVE_BRUSH_RESIDENT_MAX', 128)
+          print('PREVIEW_MAX_INFLIGHT', 8)
+
+          for f in work.rglob('*.py'):
+              compile(f.read_text(encoding='utf-8'), str(f), 'exec')
+
+          out.unlink(missing_ok=True)
+          with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+              for f in sorted(work.rglob('*')):
+                  if f.is_file():
+                      z.write(f, f.relative_to(work).as_posix())
+
+          digest = hashlib.sha256(out.read_bytes()).hexdigest()
+          out.with_suffix(out.suffix+'.sha256.txt').write_text(
+              f'{digest}  {out.name}\n', encoding='utf-8'
+          )
+          print('SHA256', digest)
+          '@ | Set-Content $py -Encoding UTF8
+          python $py
+
+      - name: Blender 5.2.0 and 5.2.2 extension validation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pkg = (Resolve-Path "$PWD/manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v24-secondary-preview-pipeline.zip").Path
+          foreach ($v in @('5.2.0','5.2.2')) {
+            $z = Join-Path $env:RUNNER_TEMP "blender-$v.zip"
+            $d = Join-Path $env:RUNNER_TEMP "blender-$v"
+            curl.exe -L --fail --retry 3 "https://download.blender.org/release/Blender5.2/blender-$v-windows-x64.zip" -o $z
+            if ($LASTEXITCODE -ne 0) { throw "Blender $v download failed" }
+            Expand-Archive $z $d -Force
+            $exe = Get-ChildItem $d -Filter blender.exe -Recurse | Select-Object -First 1
+            if (-not $exe) { throw "Blender $v executable missing" }
+            & $exe.FullName --command extension validate $pkg
+            if ($LASTEXITCODE -ne 0) { throw "Blender $v validation failed" }
+          }
+
+      - name: Publish
+        shell: pwsh
+        run: |
+          git config user.name 'LumaFold Build Bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v24-secondary-preview-pipeline.zip*
+          git commit -m "candidate: exact bounded Secondary Brush preview pipeline"
+          git push origin HEAD:main
