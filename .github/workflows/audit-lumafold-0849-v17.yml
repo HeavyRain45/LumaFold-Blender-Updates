@@ -1,0 +1,128 @@
+name: Audit LumaFold 0.8.49 V17
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/audit-lumafold-0849-v17.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Static lifecycle and memory-bound audit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pkg = "$PWD/manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v17-preview-cache.zip"
+          $stage = Join-Path $env:RUNNER_TEMP 'lf_v17_audit'
+          if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+          Expand-Archive -Path $pkg -DestinationPath $stage -Force
+          $py = Join-Path $env:RUNNER_TEMP 'audit_v17.py'
+          @"
+          import pathlib, py_compile, re, sys
+          root = pathlib.Path(r'''$stage''')
+
+          # Syntax gate all Python files, not just touched modules.
+          files = sorted(root.rglob('*.py'))
+          for f in files:
+              py_compile.compile(str(f), doraise=True)
+          print('PY_COMPILE_OK', len(files))
+
+          sat_rt = (root/'desktop/satellite_host_runtime.py').read_text(encoding='utf-8')
+          sat = (root/'desktop/satellite_host.py').read_text(encoding='utf-8')
+          sec_rt = (root/'desktop/secondary_surface_host_runtime.py').read_text(encoding='utf-8')
+          sec = (root/'desktop/secondary_surface_host.py').read_text(encoding='utf-8')
+          tex = (root/'ui/preview_textures.py').read_text(encoding='utf-8')
+          native = (root/'desktop/native_imgui_wgl.py').read_text(encoding='utf-8')
+          sched = (root/'runtime/preview_scheduler.py').read_text(encoding='utf-8')
+          visual = (root/'runtime/primary_visual_assets.py').read_text(encoding='utf-8')
+          resident = (root/'runtime/brush_preview_residency.py').read_text(encoding='utf-8')
+          perf = (root/'runtime/preview_performance.py').read_text(encoding='utf-8')
+          bridge = (root/'desktop/bridge_server.py').read_text(encoding='utf-8')
+
+          # No unbounded idle Bridge polling in steady-state Satellite/Secondary.
+          sat_worker = sat[sat.index('def _network_worker_after_first_render'):sat.index('def _sync_product_extras')]
+          assert 'actions.get(timeout=0.25)' in sat_worker
+          assert 'action = {"action": "get_state"}' not in sat_worker
+          sec_worker = sec[sec.index('def _network_worker_watchdog'):sec.index('_runtime._network_worker = _network_worker_watchdog')]
+          assert 'actions.get(timeout=0.25)' in sec_worker
+          assert 'payload = {"action": "get_state"}' not in sec_worker
+
+          # Accepted first-stroke/focus and quick-slot fixes remain present.
+          assert 'WS_EX_NOACTIVATE = 0x08000000' in sat_rt
+          assert 'SW_SHOWNOACTIVATE' in sat_rt
+          assert '_restore_blender_foreground_if_satellite_activated()' in sat
+          assert '_mirror_quick_shortcut_selection()' in sat
+          assert 'host_switch_hit_test(x, y)' in sat
+          assert 'sculpt.brush.library_replace_slot' in sec
+          assert 'get_sculpt_visual_state' in bridge
+
+          # Preview CPU/GPU caches are bounded.
+          assert 'while len(merged) > 48:' in sat_rt
+          assert '_BRUSH_CACHE_ITEMS = 160' in sched
+          assert '_ALPHA_CACHE_ITEMS = 128' in sched
+          assert '_MAX_NATIVE_ITEMS = 192' in resident
+          assert 'self.max_items = max(192, int(max_items))' in tex
+          assert 'while len(self._textures) > self.max_items:' in tex
+          assert 'renderer.unregister_texture(old_id)' in tex
+
+          # GPU resources and child process are released on shutdown.
+          assert 'def shutdown(self):' in tex
+          assert 'renderer.unregister_texture(tex_id)' in tex
+          assert 'preview_textures.shutdown()' in sat_rt
+          assert 'preview_textures.shutdown()' in sec_rt
+          assert 'renderer.shutdown()' in sat_rt
+          assert 'renderer.shutdown()' in sec_rt
+          assert 'glDeleteTextures' in native
+          assert 'wglDeleteContext' in native
+          assert 'ReleaseDC' in native
+          assert 'def _destroy_secondary_surface():' in sat_rt
+          assert 'proc.terminate()' in sat_rt
+          assert 'proc.kill()' in sat_rt
+
+          # Background timers terminate through installed/configured guards.
+          assert 'if not _INSTALLED:' in sched
+          assert 'if not _INSTALLED:' in perf
+          assert 'bpy.utils.previews.remove(_COLLECTION)' in resident
+
+          # Preview-cache semantics: visual delta merges, never replaces residency.
+          sync = sat_rt[sat_rt.index('def _sync_local_from_snapshot'):sat_rt.index('def network_worker')]
+          assert 'if key == "brush_preview_cache":' in sync
+          assert 'merged = dict(local_sculpt.get("brush_preview_cache") or {})' in sync
+          assert 'local_sculpt["brush_preview_cache"] = merged' in sync
+
+          # Rough payload-only upper-bound estimate at 64x64 RGBA8. This is not
+          # process RSS; it is a sanity bound for resident thumbnail pixels.
+          rgba = 64*64*4
+          base64_bytes = ((rgba + 2)//3)*4
+          cpu_payload = (160*2 + 128*2 + 48) * base64_bytes
+          gpu_payload = (256 + 192) * rgba
+          print('PREVIEW_CPU_PAYLOAD_APPROX_MIB', round(cpu_payload/1024/1024, 2))
+          print('PREVIEW_GPU_PAYLOAD_APPROX_MIB', round(gpu_payload/1024/1024, 2))
+          print('V17_LIFECYCLE_MEMORY_AUDIT_OK')
+          "@ | Set-Content -Path $py -Encoding UTF8
+          python $py
+          if ($LASTEXITCODE -ne 0) { throw "V17 static/lifecycle audit failed" }
+
+      - name: Blender 5.2.0 and 5.2.2 extension validation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pkg = (Resolve-Path "$PWD/manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v17-preview-cache.zip").Path
+          foreach ($v in @('5.2.0','5.2.2')) {
+            $z = Join-Path $env:RUNNER_TEMP "blender-$v.zip"
+            $d = Join-Path $env:RUNNER_TEMP "blender-$v"
+            curl.exe -L --fail --retry 3 "https://download.blender.org/release/Blender5.2/blender-$v-windows-x64.zip" -o $z
+            if ($LASTEXITCODE -ne 0) { throw "Blender $v download failed" }
+            Expand-Archive $z $d -Force
+            $exe = Get-ChildItem $d -Filter blender.exe -Recurse | Select-Object -First 1
+            if (-not $exe) { throw "Blender $v executable missing" }
+            & $exe.FullName --command extension validate $pkg
+            if ($LASTEXITCODE -ne 0) { throw "Blender $v validation failed" }
+          }
