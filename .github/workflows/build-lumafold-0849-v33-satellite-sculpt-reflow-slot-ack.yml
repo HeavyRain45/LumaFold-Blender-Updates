@@ -74,10 +74,8 @@ jobs:
           bridge = work/'desktop/bridge_server.py'
           b = bridge.read_text(encoding='utf-8').replace('\r\n','\n')
 
-          old_special = '''            if command_id == "sculpt.brush.library_replace_slot":
-                      response["state"] = self._sculpt_visual_state()
-                  elif satellite_client and command_id in {"sculpt.enter", "sculpt.exit_to_object"}:
-          '''
+          ack_start = b.index('            if command_id == "sculpt.brush.library_replace_slot":')
+          ack_next = b.index('            elif satellite_client and command_id in {"sculpt.enter", "sculpt.exit_to_object"}:', ack_start)
           new_special = '''            if command_id in {
                       "sculpt.brush.library_replace_slot",
                       "sculpt.brush.library_assign_slot",
@@ -90,11 +88,8 @@ jobs:
                       # Return the compact visual state immediately so Satellite
                       # does not remain stale until a Host re-entry snapshot.
                       response["state"] = self._sculpt_visual_state()
-                  elif satellite_client and command_id in {"sculpt.enter", "sculpt.exit_to_object"}:
           '''
-          if old_special not in b:
-              raise SystemExit('bridge slot visual ACK branch not found')
-          b = b.replace(old_special, new_special, 1)
+          b = b[:ack_start] + new_special + b[ack_next:]
           compile(b, str(bridge), 'exec')
           bridge.write_text(b, encoding='utf-8', newline='\n')
 
