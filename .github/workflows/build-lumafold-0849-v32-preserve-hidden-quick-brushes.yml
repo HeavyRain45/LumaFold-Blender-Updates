@@ -1,0 +1,286 @@
+name: Build LumaFold 0.8.49 V32 Preserve Hidden Quick Brushes
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build-lumafold-0849-v32-preserve-hidden-quick-brushes.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch V31
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $py = Join-Path $env:RUNNER_TEMP 'v32.py'
+          @'
+          import pathlib, zipfile, shutil, hashlib, os
+
+          root = pathlib.Path.cwd()
+          src = root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v31-satellite-live-row-rebase.zip'
+          out = root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v32-preserve-hidden-quick-brushes.zip'
+          work = pathlib.Path(os.environ['RUNNER_TEMP'])/'lf_v32'
+          shutil.rmtree(work, ignore_errors=True)
+          work.mkdir(parents=True)
+          with zipfile.ZipFile(src) as z:
+              z.extractall(work)
+
+          # ==============================================================
+          # A) Satellite row count is visibility only.
+          #
+          # Re-publish the complete local Quick Brush slot array before the
+          # row-count command. This makes 2/3/4 rows a pure presentation change:
+          # hidden slots cannot be replaced by defaults/empties during a host
+          # transition or row-state reconciliation.
+          # ==============================================================
+
+          runtime = work/'desktop/satellite_host_runtime.py'
+          r = runtime.read_text(encoding='utf-8').replace('\r\n','\n')
+
+          qstart = r.index('def _queue_quick_rows(rows):')
+          qend = r.index('\n\ndef _secondary_log_path', qstart)
+          qb = r[qstart:qend]
+
+          old_tail = '''    _pending_quick_rows = rows
+              _primary_resize_pending = True
+              actions.put({"action": "command", "command_id": "sculpt.brush.set_quick_rows", "kwargs": {"rows": rows}})
+          '''
+
+          new_tail = '''    # A row-count change must never define storage length. Preserve the exact
+              # full Quick Brush slot model already resident in Satellite, then let
+              # Blender change only quick_rows / slot_count.
+              slot_snapshot = [dict(item or {}) for item in list(local_sculpt.get("quick_brush_slots") or ())]
+              if slot_snapshot:
+                  actions.put({
+                      "action": "set_module_state",
+                      "namespace": "sculpt",
+                      "fields": {"quick_brush_slots": slot_snapshot},
+                  })
+
+              _pending_quick_rows = rows
+              _primary_resize_pending = True
+              actions.put({"action": "command", "command_id": "sculpt.brush.set_quick_rows", "kwargs": {"rows": rows}})
+          '''
+
+          if old_tail not in qb:
+              raise SystemExit('V31 row queue tail not found')
+          qb = qb.replace(old_tail, new_tail, 1)
+          r = r[:qstart] + qb + r[qend:]
+          compile(r, str(runtime), 'exec')
+          runtime.write_text(r, encoding='utf-8', newline='\n')
+
+          # ==============================================================
+          # B) Hidden Quick Brush previews stay warm.
+          #
+          # Maximum Quick Brush count is 16. The existing Satellite wire budget
+          # was already designed for <=16 previews, but three filters reduced the
+          # cache to rows*4. That means a 2-row Satellite deliberately discards
+          # previews for rows 3/4, producing blank icons when expanded.
+          #
+          # Keep all non-empty <=16 Quick Brush previews on the Satellite wire,
+          # independent of current visible row count.
+          # ==============================================================
+
+          visual = work/'runtime/primary_visual_assets.py'
+          v = visual.read_text(encoding='utf-8').replace('\r\n','\n')
+          old_v = '''    slots = list(sculpt.get("quick_brush_slots") or ())
+              try:
+                  rows = max(2, min(4, int(sculpt.get("quick_rows", 2) or 2)))
+              except Exception:
+                  rows = 2
+              identities = []
+              for slot in slots[: rows * 4]:
+          '''
+          new_v = '''    slots = list(sculpt.get("quick_brush_slots") or ())
+              identities = []
+              # Row count controls visibility, not preview residency. The compact
+              # Satellite supports at most 16 Quick Brush slots and its wire budget
+              # is sized for that complete set.
+              for slot in slots[:16]:
+          '''
+          if old_v not in v:
+              raise SystemExit('primary_visual_assets visible-row preview filter not found')
+          v = v.replace(old_v, new_v, 1)
+          compile(v, str(visual), 'exec')
+          visual.write_text(v, encoding='utf-8', newline='\n')
+
+          authority = work/'runtime/satellite_bridge_authority.py'
+          a = authority.read_text(encoding='utf-8').replace('\r\n','\n')
+          old_a = '''    slots = list(sculpt_bucket.get("quick_brush_slots") or ())
+              try:
+                  rows = max(2, min(4, int(sculpt_bucket.get("quick_rows", 2) or 2)))
+              except Exception:
+                  rows = 2
+
+              identities = []
+              for slot in slots[: rows * 4]:
+          '''
+          new_a = '''    slots = list(sculpt_bucket.get("quick_brush_slots") or ())
+
+              identities = []
+              # Preserve previews for all possible Quick Brush slots even while
+              # rows 3/4 are visually collapsed.
+              for slot in slots[:16]:
+          '''
+          if old_a not in a:
+              raise SystemExit('satellite authority visible-row preview filter not found')
+          a = a.replace(old_a, new_a, 1)
+          compile(a, str(authority), 'exec')
+          authority.write_text(a, encoding='utf-8', newline='\n')
+
+          bridge = work/'desktop/bridge_server.py'
+          b = bridge.read_text(encoding='utf-8').replace('\r\n','\n')
+          old_b = '''        slots = list(sculpt_state.get("quick_brush_slots") or ())
+                  try:
+                      rows = max(2, min(4, int(sculpt_state.get("quick_rows", 2) or 2)))
+                  except Exception:
+                      rows = 2
+
+                  compact = {}
+                  for slot in slots[: rows * 4]:
+          '''
+          new_b = '''        slots = list(sculpt_state.get("quick_brush_slots") or ())
+
+                  compact = {}
+                  # Satellite may expand from 2 -> 4 rows without another preview
+                  # build. Carry the complete <=16 Quick Brush preview set.
+                  for slot in slots[:16]:
+          '''
+          if old_b not in b:
+              raise SystemExit('bridge visual-state visible-row preview filter not found')
+          b = b.replace(old_b, new_b, 1)
+          compile(b, str(bridge), 'exec')
+          bridge.write_text(b, encoding='utf-8', newline='\n')
+
+          # Primary UI lazy warm-up: request all non-empty Quick Brush slot
+          # identities, not just the currently visible rows. 16 is a tiny bounded
+          # working set and eliminates icon pop-in after row expansion.
+          view = work/'ui/sculpt_view.py'
+          u = view.read_text(encoding='utf-8').replace('\r\n','\n')
+          old_u = '''    slots = list(sculpt.get("quick_brush_slots") or ())
+              rows = max(2, min(4, int(sculpt.get("quick_rows", 2) or 2)))
+              visible = slots[: min(len(slots), rows * 4)]
+              identities = []
+              for slot in visible:
+          '''
+          new_u = '''    slots = list(sculpt.get("quick_brush_slots") or ())
+              # Keep every possible Quick Brush preview warm. quick_rows only
+              # changes how many tiles are drawn; it must not evict hidden icons.
+              visible = slots[: min(len(slots), 16)]
+              identities = []
+              for slot in visible:
+          '''
+          if old_u not in u:
+              raise SystemExit('Quick Brush warm-up visible-row filter not found')
+          u = u.replace(old_u, new_u, 1)
+          compile(u, str(view), 'exec')
+          view.write_text(u, encoding='utf-8', newline='\n')
+
+          # ==============================================================
+          # Regression gates
+          # ==============================================================
+
+          foundation = (work/'ui/sculpt_view_foundation.py').read_text(encoding='utf-8')
+          session = (work/'desktop/secondary_surface_session.py').read_text(encoding='utf-8')
+          secondary = (work/'desktop/secondary_surface_host.py').read_text(encoding='utf-8')
+          nav = (work/'runtime/sculpt_navigation.py').read_text(encoding='utf-8')
+          pointer = (work/'runtime/sculpt_native_pointer.py').read_text(encoding='utf-8')
+          mask = (work/'runtime/sculpt_mask_gesture.py').read_text(encoding='utf-8')
+          route = (work/'runtime/sculpt_route_truth.py').read_text(encoding='utf-8')
+          sat = (work/'desktop/satellite_host.py').read_text(encoding='utf-8')
+
+          # V32: row visibility cannot discard slot data or hidden previews.
+          assert '"fields": {"quick_brush_slots": slot_snapshot}' in r
+          assert 'for slot in slots[:16]:' in v
+          assert 'for slot in slots[:16]:' in a
+          assert 'for slot in slots[:16]:' in b
+          assert 'visible = slots[: min(len(slots), 16)]' in u
+          assert 'slots[: rows * 4]' not in v[v.index('def _satellite_quick_preview_cache'):v.index('def _install_snapshot_filter')]
+          assert 'slots[: rows * 4]' not in a[a.index('def _compact_quick_preview_cache'):a.index('def _bounded_preview_cache')]
+
+          # V31 live resize is frozen.
+          qblock = r[r.index('def _queue_quick_rows(rows):'):r.index('\n\ndef _secondary_log_path', r.index('def _queue_quick_rows(rows):'))]
+          assert 'current_rows = clamp_quick_rows(local_sculpt.get("quick_rows", 2))' in qblock
+          assert 'user32.GetClientRect(hwnd_main' in qblock
+          assert '_primary_base_height_design = normalize_base_height_design(' in qblock
+          assert 'set_exact_client_size(hwnd_main, target_w, target_h)' in r
+          assert '_apply_rounded_window_region(hwnd_main)' in r
+
+          # V30 layout-metric split remains.
+          assert 'surface_state["sculpt_primary_bottom_anchor"] = dict(brush_anchor)' in foundation
+          assert 'surface_state.get("sculpt_primary_bottom_anchor")' in r
+
+          # V29 popup/open behavior remains.
+          assert 'def _toggle_secondary_surface(kind="brush_library", anchor=None, *, open_only=False):' in r
+          assert '_toggle_secondary_surface(kind, anchor, open_only=True)' in r
+          assert 'runtime._toggle_secondary_surface(kind, anchor, open_only=True)' in session
+
+          # V27/V28 Quick Brush first-click + native Shift snap remain.
+          assert 'pressed_preview = False' in u
+          assert 'imgui_arg.is_mouse_clicked(0)' in u
+          assert '_open_targeted_library(int(ident)' in u
+          assert 'def invoke_blender_rotate(target) -> bool:' in nav
+          assert 'AXIS_SNAP_ENABLE' in nav and 'AXIS_SNAP_DISABLE' in nav
+          assert 'LEFT_SHIFT' in nav and 'RIGHT_SHIFT' in nav
+          assert 'getattr(navigation, "invoke_blender_rotate", None)' in pointer
+
+          # Preserve preview / Mask / Satellite first-stroke chain.
+          assert 'on_request_preview=_request_brush_previews_exact' in secondary
+          assert '_BRUSH_PREVIEW_QUEUE_LIMIT = 4' in secondary
+          assert 'clean_age >= 0.18' in secondary
+          assert '_CLASSES = (LUMAFOLD_OT_sculpt_mask_gesture_v2,)' in mask
+          assert 'mask_feather_tap' in mask
+          assert 'mask_sharpen_tap' in mask
+          assert 'background_invert_tap' in mask
+          assert 'satellite_pointer_guard' in route
+          assert 'satellite_client_pointer_reprime' in sat
+
+          for py in work.rglob('*.py'):
+              compile(py.read_text(encoding='utf-8'), str(py), 'exec')
+
+          out.unlink(missing_ok=True)
+          with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+              for file in sorted(work.rglob('*')):
+                  if file.is_file():
+                      z.write(file, file.relative_to(work).as_posix())
+
+          digest = hashlib.sha256(out.read_bytes()).hexdigest()
+          out.with_suffix(out.suffix+'.sha256.txt').write_text(
+              f'{digest}  {out.name}\n', encoding='utf-8'
+          )
+          print('SHA256', digest)
+          '@ | Set-Content $py -Encoding UTF8
+          python $py
+
+      - name: Blender 5.2.0 and 5.2.2 extension validation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pkg = (Resolve-Path "$PWD/manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v32-preserve-hidden-quick-brushes.zip").Path
+          foreach ($v in @('5.2.0','5.2.2')) {
+            $z = Join-Path $env:RUNNER_TEMP "blender-$v.zip"
+            $d = Join-Path $env:RUNNER_TEMP "blender-$v"
+            curl.exe -L --fail --retry 3 "https://download.blender.org/release/Blender5.2/blender-$v-windows-x64.zip" -o $z
+            if ($LASTEXITCODE -ne 0) { throw "Blender $v download failed" }
+            Expand-Archive $z $d -Force
+            $exe = Get-ChildItem $d -Filter blender.exe -Recurse | Select-Object -First 1
+            if (-not $exe) { throw "Blender $v executable missing" }
+            & $exe.FullName --command extension validate $pkg
+            if ($LASTEXITCODE -ne 0) { throw "Blender $v validation failed" }
+          }
+
+      - name: Publish
+        shell: pwsh
+        run: |
+          git config user.name 'LumaFold Build Bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v32-preserve-hidden-quick-brushes.zip*
+          git commit -m "candidate: preserve hidden Quick Brush slots and previews across row changes"
+          git push origin HEAD:main
