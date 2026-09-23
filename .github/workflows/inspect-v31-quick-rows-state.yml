@@ -1,0 +1,50 @@
+name: Inspect V31 Quick Rows State
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/inspect-v31-quick-rows-state.yml']
+
+jobs:
+  inspect:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inspect candidate sources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $py = Join-Path $env:RUNNER_TEMP 'inspect_v31.py'
+          @'
+          import pathlib, zipfile, tempfile, shutil, re
+          root = pathlib.Path.cwd()
+          src = root/'manual/candidates/lumafold-0.8.49-self-contained-satellite-first-stroke-hotfix-v31-satellite-live-row-rebase.zip'
+          work = pathlib.Path(tempfile.mkdtemp(prefix='v31inspect_'))
+          with zipfile.ZipFile(src) as z:
+              z.extractall(work)
+
+          needles = [
+              'set_quick_rows', 'quick_rows', 'quick_brush_slots',
+              'slot_count', 'brush_preview_cache', 'primary_brush_preview_cache',
+              'visible_count', 'rows * 4',
+          ]
+          for p in sorted(work.rglob('*.py')):
+              text = p.read_text(encoding='utf-8', errors='replace')
+              hits = [n for n in needles if n in text]
+              if not hits:
+                  continue
+              print('\n===== FILE', p.relative_to(work).as_posix(), 'HITS', hits, '=====')
+              lines = text.splitlines()
+              matched = set()
+              for i,line in enumerate(lines):
+                  if any(n in line for n in needles):
+                      for j in range(max(0,i-12), min(len(lines), i+24)):
+                          matched.add(j)
+              last = None
+              for j in sorted(matched):
+                  if last is not None and j > last + 1:
+                      print('...')
+                  print(f'{j+1:04d}: {lines[j]}')
+                  last = j
+          '@ | Set-Content $py -Encoding UTF8
+          python $py
