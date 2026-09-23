@@ -74,22 +74,11 @@ jobs:
           bridge = work/'desktop/bridge_server.py'
           b = bridge.read_text(encoding='utf-8').replace('\r\n','\n')
 
-          ack_start = b.index('            if command_id == "sculpt.brush.library_replace_slot":')
-          ack_next = b.index('            elif satellite_client and command_id in {"sculpt.enter", "sculpt.exit_to_object"}:', ack_start)
-          new_special = '''            if command_id in {
-                      "sculpt.brush.library_replace_slot",
-                      "sculpt.brush.library_assign_slot",
-                      "sculpt.brush.assign_current_to_slot",
-                      "sculpt.brush.clear_slot",
-                      "sculpt.brush.reset_quick_slots",
-                  }:
-                      # Slot-content mutations are not safely optimistic: Blender
-                      # owns the canonical Brush Asset identity and final label.
-                      # Return the compact visual state immediately so Satellite
-                      # does not remain stale until a Host re-entry snapshot.
-                      response["state"] = self._sculpt_visual_state()
-          '''
-          b = b[:ack_start] + new_special + b[ack_next:]
+          old_condition = '            if command_id == "sculpt.brush.library_replace_slot":\\n'
+          new_condition = '            if command_id in {"sculpt.brush.library_replace_slot", "sculpt.brush.library_assign_slot", "sculpt.brush.assign_current_to_slot", "sculpt.brush.clear_slot", "sculpt.brush.reset_quick_slots"}:\\n'
+          if old_condition not in b:
+              raise SystemExit('bridge slot visual ACK condition not found')
+          b = b.replace(old_condition, new_condition, 1)
           compile(b, str(bridge), 'exec')
           bridge.write_text(b, encoding='utf-8', newline='\n')
 
